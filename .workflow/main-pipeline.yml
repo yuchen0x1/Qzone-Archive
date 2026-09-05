@@ -1,0 +1,32 @@
+version: '1.0'
+name: main-pipeline
+displayName: 质量检查
+triggers:
+  trigger: auto
+  push:
+    branches:
+      include:
+        - main
+stages:
+  - name: quality
+    displayName: 质量检查
+    strategy: naturally
+    trigger: auto
+    executor: []
+    steps:
+      - step: build@nodejs
+        name: build_frontend
+        displayName: 前端与文档站构建
+        # 需为流水线运行端可用的 Node 版本（本项目 Vite 6 要求 >= 18）；
+        # 若提示该版本不可用，请在 Gitee 流水线网页端下拉列表中选择可用版本
+        nodeVersion: 20.19.0
+        commands:
+          - npm config set registry https://registry.npmmirror.com
+          - npm ci --no-audit --no-fund
+          - npm run build
+          - cd website && npm ci --no-audit --no-fund && npm run build
+        caches:
+          - ~/.npm
+        notify: []
+        strategy:
+          retry: '0'
