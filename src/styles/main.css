@@ -396,6 +396,18 @@ body:has(.app-dark)::-webkit-scrollbar-thumb:active {
 .package-fieldset legend { padding: 0 6px; color: var(--heading); font-size: 12px; font-weight: 700; }
 .package-check { display: flex; align-items: center; gap: 9px; color: var(--heading); font-size: 13px; cursor: pointer; }
 .package-warn { display: flex; align-items: center; gap: 8px; margin: 0; color: #8a6116; font-size: 12px; }
+.package-single-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.package-hint { color: var(--muted); font-size: 11px; line-height: 1.6; }
+.archive-error.is-info { color: #1d5c8f; background: #eef6fd; border-color: #cfe6f7; }
+.archive-header-actions .gb-syncing { color: var(--primary); }
+.contacts-mode-tabs { display: inline-flex; gap: 4px; padding: 4px; background: var(--app-bg); border-radius: 10px; }
+.contacts-mode-tab { padding: 7px 16px; color: var(--muted); background: transparent; border: 0; border-radius: 7px; font-size: 13px; font-weight: 600; cursor: pointer; transition: color .15s ease, background .15s ease; }
+.contacts-mode-tab.is-active { color: var(--primary); background: var(--surface-solid); box-shadow: 0 2px 8px rgba(25,44,74,.08); }
+@media (max-width: 767px) {
+  .contacts-toolbar { flex-wrap: wrap; }
+  .contacts-mode-tabs { width: 100%; justify-content: stretch; }
+  .contacts-mode-tab { flex: 1; }
+}
 .package-result { padding: 12px 14px; background: color-mix(in srgb,#2fa96a 9%,transparent); border-radius: 10px; }
 .package-result p { display: flex; align-items: center; gap: 8px; margin: 0 0 6px; color: var(--heading); font-size: 13px; overflow-wrap: anywhere; }
 .package-result p i { color: #2fa96a; }

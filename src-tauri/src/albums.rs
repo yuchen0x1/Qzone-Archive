@@ -127,7 +127,7 @@ fn set_album_progress(state: &AlbumState, update: impl FnOnce(&mut AlbumProgress
     }
 }
 
-fn text_field(value: &Value, keys: &[&str]) -> Option<String> {
+pub(crate) fn text_field(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         let field = value.get(*key)?;
         match field {
@@ -138,7 +138,7 @@ fn text_field(value: &Value, keys: &[&str]) -> Option<String> {
     })
 }
 
-fn time_field(value: &Value, keys: &[&str]) -> Option<i64> {
+pub(crate) fn time_field(value: &Value, keys: &[&str]) -> Option<i64> {
     keys.iter().find_map(|key| {
         let field = value.get(*key)?;
         if let Some(number) = field.as_i64() {
@@ -675,10 +675,15 @@ pub async fn start_album_backup(
                 );
             });
 
-            // 2.1 分页列出照片并入库（重复运行自动去重）
-            const PAGE_NUM: u32 = 300;
+            // 2.1 分页列出照片并入库。服务端可能把单页封顶在 100（即使请求更大），
+            // 因此不能用“返回条数 < 请求条数”判断结束，而是翻到空页或连续无新照片为止；
+            // 以 pic_key 去重防止接口在末页反复返回同一页导致死循环。
+            const PAGE_NUM: u32 = 100;
+            const MAX_PAGES: u32 = 500;
             let mut page_start: u32 = 0;
-            loop {
+            let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut server_total: Option<u64> = None;
+            for _page_index in 0..MAX_PAGES {
                 if albums.cancel.load(Ordering::Relaxed) {
                     break;
                 }
@@ -686,13 +691,25 @@ pub async fn start_album_backup(
                     return Err(format!("ALBUM_RATE_LIMIT:{retry_at}"));
                 }
                 let page = qzone::fetch_photo_page(&login, album_id, page_start, PAGE_NUM).await?;
+                if server_total.is_none() {
+                    server_total = crate::albums::time_field(
+                        page.get("data").unwrap_or(&Value::Null),
+                        &["total", "photocount", "photoTotal"],
+                    )
+                    .map(|total| total.max(0) as u64);
+                }
                 let photos = parse_photo_list(&page);
-                let fetched = photos.len();
+                let new_count = photos
+                    .iter()
+                    .filter(|photo| seen_keys.insert(photo.pic_key.clone()))
+                    .count();
                 {
                     let connection = open_database(&app)?;
                     upsert_photos(&connection, &owner_uin, album_id, &photos, now())?;
                 }
-                if fetched < PAGE_NUM as usize {
+                let reached_total =
+                    server_total.is_some_and(|total| seen_keys.len() as u64 >= total);
+                if photos.is_empty() || new_count == 0 || reached_total {
                     break;
                 }
                 page_start = page_start.saturating_add(PAGE_NUM);

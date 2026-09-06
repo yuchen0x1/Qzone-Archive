@@ -27,6 +27,10 @@ const PHOTO_LIST_URL: &str =
     "https://h5.qzone.qq.com/proxy/domain/photo.qzone.qq.com/fcgi-bin/fcg_list_photo_v3";
 const CREATE_ALBUM_URL: &str =
     "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/cgi-bin/common/cgi_add_album_v2";
+const GUESTBOOK_URL: &str =
+    "https://user.qzone.qq.com/proxy/domain/m.qzone.qq.com/cgi-bin/new/guestbook/get_guestbook_list";
+const FRIEND_LIST_URL: &str =
+    "https://h5.qzone.qq.com/proxy/domain/r.qzone.qq.com/cgi-bin/tfriend/friend_head_get.fcg";
 
 #[derive(Clone, Default)]
 pub struct RecycleAuthState {
@@ -907,6 +911,83 @@ pub async fn recover_recycle_photos(
         }
     }
     Ok(parsed)
+}
+
+/// 留言板分页：start 从 0 开始，num 为单页条数（腾讯侧一般封顶 20）。
+#[tauri::command]
+pub async fn fetch_guestbook_page(
+    state: tauri::State<'_, QLoginState>,
+    start: u32,
+    num: u32,
+) -> Result<Value, String> {
+    let auth = state.qzone_auth().await?;
+    let num = num.clamp(1, 20);
+    let query = vec![
+        ("uin", auth.uin.clone()),
+        ("hostUin", auth.uin.clone()),
+        ("start", start.to_string()),
+        ("num", num.to_string()),
+        ("g_tk", auth.g_tk.to_string()),
+        ("format", "json".into()),
+        ("inCharset", "utf-8".into()),
+        ("outCharset", "utf-8".into()),
+        ("notice", "0".into()),
+    ];
+    let response = state
+        .client()
+        .get(GUESTBOOK_URL)
+        .query(&query)
+        .header(ACCEPT, "application/json, text/javascript, */*; q=0.01")
+        .header(REFERER, format!("https://user.qzone.qq.com/{}", auth.uin))
+        .header(USER_AGENT, &auth.user_agent)
+        .header(COOKIE, &auth.cookie_header)
+        .send()
+        .await
+        .map_err(|error| format!("获取留言板失败：{error}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("读取留言板响应失败：{error}"))?;
+    if !status.is_success() {
+        return Err(format!("获取留言板失败：HTTP {status}"));
+    }
+    ensure_qzone_success(parse_qzone_json(&text)?)
+}
+
+/// 好友列表（当前账号在 QQ 空间可见的好友）。
+#[tauri::command]
+pub async fn fetch_friend_list(state: tauri::State<'_, QLoginState>) -> Result<Value, String> {
+    let auth = state.qzone_auth().await?;
+    let query = vec![
+        ("uin", auth.uin.clone()),
+        ("hostUin", auth.uin.clone()),
+        ("g_tk", auth.g_tk.to_string()),
+        ("format", "json".into()),
+        ("inCharset", "utf-8".into()),
+        ("outCharset", "utf-8".into()),
+        ("notice", "0".into()),
+    ];
+    let response = state
+        .client()
+        .get(FRIEND_LIST_URL)
+        .query(&query)
+        .header(ACCEPT, "application/json, text/javascript, */*; q=0.01")
+        .header(REFERER, format!("https://user.qzone.qq.com/{}", auth.uin))
+        .header(USER_AGENT, &auth.user_agent)
+        .header(COOKIE, &auth.cookie_header)
+        .send()
+        .await
+        .map_err(|error| format!("获取好友列表失败：{error}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("读取好友列表响应失败：{error}"))?;
+    if !status.is_success() {
+        return Err(format!("获取好友列表失败：HTTP {status}"));
+    }
+    ensure_qzone_success(parse_qzone_json(&text)?)
 }
 
 fn retryable_response_reason(status: reqwest::StatusCode, body: &str) -> Option<String> {

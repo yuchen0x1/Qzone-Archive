@@ -11,7 +11,7 @@ use std::{
 
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tauri::Manager;
 use url::Url;
 
@@ -285,7 +285,7 @@ pub(crate) fn database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 /// 数据库结构版本：仅在版本落后时执行一次建表与数据迁移；
 /// 否则归档循环里每页多次打开数据库都会重复执行 DDL 与全表扫描，库越大越慢。
-const DATABASE_SCHEMA_VERSION: i32 = 2;
+const DATABASE_SCHEMA_VERSION: i32 = 3;
 
 pub(crate) fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
     let mut connection = Connection::open(database_path(app)?)
@@ -415,7 +415,15 @@ pub(crate) fn open_database(app: &tauri::AppHandle) -> Result<Connection, String
          CREATE INDEX IF NOT EXISTS idx_archive_album_photos_album
            ON archive_album_photos(owner_uin, album_id, upload_time);
          CREATE INDEX IF NOT EXISTS idx_archive_album_photos_status
-           ON archive_album_photos(owner_uin, album_id, status);",
+           ON archive_album_photos(owner_uin, album_id, status);
+         CREATE TABLE IF NOT EXISTS friend_contacts (
+           owner_uin TEXT NOT NULL,
+           uin TEXT NOT NULL,
+           nickname TEXT,
+           remark TEXT,
+           archived_at INTEGER NOT NULL,
+           UNIQUE(owner_uin, uin)
+         );",
         )
         .map_err(|error| format!("初始化归档数据库失败：{error}"))?;
     if connection
@@ -3289,14 +3297,575 @@ pub async fn list_interactors(
         .map_err(|error| format!("读取联系人失败：{error}"))
 }
 
+// ---------- 留言板全量同步 ----------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestbookSyncPage {
+    fetched: u64,
+    saved: u64,
+    total: u64,
+}
+
+struct GuestbookReply {
+    uin: Option<String>,
+    nickname: Option<String>,
+    reply_to: Option<String>,
+    content: String,
+    time: i64,
+}
+
+struct GuestbookEntry {
+    key: String,
+    author_uin: Option<String>,
+    author_name: Option<String>,
+    content: String,
+    time: i64,
+    replies: Vec<GuestbookReply>,
+    raw: Value,
+}
+
+/// 兼容多代留言板接口字段：条目主键、作者、正文、时间、回复列表的命名各不相同。
+pub(crate) fn parse_guestbook_page(value: &Value) -> (u64, Vec<GuestbookEntry>) {
+    let empty = Value::Null;
+    let data = value.get("data").unwrap_or(&empty);
+    let total = crate::albums::time_field(data, &["total", "commenttotal"])
+        .unwrap_or(0)
+        .max(0) as u64;
+    let list = data
+        .get("commentList")
+        .or_else(|| data.get("commentlist"))
+        .or_else(|| data.get("list"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let entries = list
+        .iter()
+        .filter_map(|entry| {
+            let content = entry
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            let author_uin = crate::albums::text_field(entry, &["uin", "posterUin", "posteruin"]);
+            let author_name = entry
+                .get("nickname")
+                .or_else(|| entry.get("posterName"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned);
+            let time =
+                crate::albums::time_field(entry, &["time", "pubtime", "createTime"]).unwrap_or(0);
+            let key = crate::albums::text_field(entry, &["id", "poppubid", "commentid", "giftid"])
+                .unwrap_or_else(|| format!("hash-{:016x}", stable_feed_hash(entry)));
+            let replies: Vec<GuestbookReply> = entry
+                .get("replyList")
+                .or_else(|| entry.get("replylist"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|reply| {
+                    let content = reply.get("content").and_then(Value::as_str)?.trim();
+                    (!content.is_empty()).then(|| GuestbookReply {
+                        uin: crate::albums::text_field(reply, &["uin", "replyUin"]),
+                        nickname: reply
+                            .get("nickname")
+                            .or_else(|| reply.get("replyName"))
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|name| !name.is_empty())
+                            .map(str::to_owned),
+                        reply_to: reply
+                            .get("replyName")
+                            .or_else(|| reply.get("targetName"))
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|name| !name.is_empty())
+                            .map(str::to_owned),
+                        content: content.to_owned(),
+                        time: crate::albums::time_field(reply, &["time", "pubtime"]).unwrap_or(0),
+                    })
+                })
+                .collect();
+            (!content.is_empty() || !replies.is_empty()).then(|| GuestbookEntry {
+                key,
+                author_uin,
+                author_name,
+                content,
+                time,
+                replies,
+                raw: entry.clone(),
+            })
+        })
+        .collect();
+    (total, entries)
+}
+
+/// 把一条留言的回复写成 archive_feeds 行（复用评论展示与导出管线）。
+fn guestbook_reply_feed_key(
+    owner: &str,
+    entry_key: &str,
+    index: usize,
+    reply: &GuestbookReply,
+) -> String {
+    format!("gb-{owner}-{entry_key}-r{index}-{}", reply.time)
+}
+
+fn reply_comments_json(reply: &GuestbookReply) -> String {
+    // 回复对象不在 replys 里重复展开（会渲染两遍），改为内容前缀，语义无损。
+    let content = match &reply.reply_to {
+        Some(target) => format!("回复 @{target}：{}", reply.content),
+        None => reply.content.clone(),
+    };
+    let mut user = serde_json::Map::new();
+    if let Some(uin) = &reply.uin {
+        user.insert("uin".into(), Value::String(uin.clone()));
+    }
+    if let Some(nickname) = &reply.nickname {
+        user.insert("nickname".into(), Value::String(nickname.clone()));
+    }
+    // 与动态评论同构：comments_json 内含 main_comment，复用 comment_from_values 解析。
+    json!({
+        "main_comment": {
+            "commentid": format!("gb-{}", reply.time),
+            "content": content,
+            "date": reply.time,
+            "replynum": 0,
+            "replys": [],
+            "user": Value::Object(user),
+        }
+    })
+    .to_string()
+}
+
+fn save_guestbook_entries(
+    connection: &Connection,
+    owner_uin: &str,
+    entries: &[GuestbookEntry],
+    timestamp: i64,
+) -> Result<u64, String> {
+    let mut saved = 0u64;
+    for entry in entries {
+        let cell_id = format!("gb-{}", entry.key);
+        let changed = connection
+            .execute(
+                "INSERT INTO archive_dynamics
+                   (owner_uin,cell_id,published_at,content,author_uin,author_name,category,raw_original_json,archived_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,'guestbook',?7,?8)
+                 ON CONFLICT(owner_uin,cell_id) DO UPDATE SET
+                   content=excluded.content, author_name=excluded.author_name,
+                   raw_original_json=excluded.raw_original_json",
+                params![
+                    owner_uin,
+                    cell_id,
+                    entry.time,
+                    entry.content,
+                    entry.author_uin,
+                    entry.author_name,
+                    entry.raw.to_string(),
+                    timestamp
+                ],
+            )
+            .map_err(|error| format!("保存留言失败：{error}"))?;
+        saved += changed as u64;
+        for (index, reply) in entry.replies.iter().enumerate() {
+            connection
+                .execute(
+                    "INSERT INTO archive_feeds
+                       (owner_uin,feed_key,cell_id,event_type,event_time,content,actor_uin,actor_name,comments_json,raw_json,archived_at)
+                     VALUES (?1,?2,?3,2,?4,?5,?6,?7,?8,'{}',?9)
+                     ON CONFLICT(owner_uin,feed_key) DO UPDATE SET
+                       content=excluded.content, comments_json=excluded.comments_json",
+                    params![
+                        owner_uin,
+                        guestbook_reply_feed_key(owner_uin, &entry.key, index, reply),
+                        cell_id,
+                        reply.time,
+                        reply.content,
+                        reply.uin,
+                        reply.nickname,
+                        reply_comments_json(reply),
+                        timestamp
+                    ],
+                )
+                .map_err(|error| format!("保存留言回复失败：{error}"))?;
+        }
+    }
+    Ok(saved)
+}
+
+/// 抓取一页留言板并入库；前端循环调用直至 fetched=0，实现可取消的分页同步。
+#[tauri::command]
+pub async fn save_guestbook_page(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    start: u32,
+    num: u32,
+) -> Result<GuestbookSyncPage, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    let page = qzone::fetch_guestbook_page(login.clone(), start, num).await?;
+    let (total, entries) = parse_guestbook_page(&page);
+    let fetched = entries.len() as u64;
+    let connection = open_database(&app)?;
+    let saved = save_guestbook_entries(&connection, &owner_uin, &entries, now())?;
+    Ok(GuestbookSyncPage {
+        fetched,
+        saved,
+        total,
+    })
+}
+
+// ---------- 好友列表 ----------
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FriendContact {
+    uin: String,
+    nickname: String,
+    remark: Option<String>,
+}
+
+/// 兼容 itemsList / list / friends 等不同响应形状与字段命名。
+pub(crate) fn parse_friend_list(value: &Value) -> Vec<FriendContact> {
+    let empty = Value::Null;
+    let data = value.get("data").unwrap_or(&empty);
+    let list = data
+        .get("itemsList")
+        .or_else(|| data.get("list"))
+        .or_else(|| data.get("friends"))
+        .or_else(|| data.get("friendList"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    list.iter()
+        .filter_map(|item| {
+            let uin = crate::albums::text_field(item, &["uin", "id"])?;
+            if uin.is_empty() || uin == "0" {
+                return None;
+            }
+            let nickname = crate::albums::text_field(item, &["nickname", "nick", "name"])
+                .unwrap_or_else(|| uin.clone());
+            Some(FriendContact {
+                uin,
+                nickname,
+                remark: crate::albums::text_field(item, &["remark", "remarkname"])
+                    .filter(|remark| !remark.is_empty()),
+            })
+        })
+        .collect()
+}
+
+#[tauri::command]
+pub async fn sync_friend_list(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+) -> Result<Vec<FriendContact>, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    let response = qzone::fetch_friend_list(login.clone()).await?;
+    let friends = parse_friend_list(&response);
+    if friends.is_empty() {
+        return Err("好友列表为空或接口未返回数据，请稍后重试".into());
+    }
+    let connection = open_database(&app)?;
+    let timestamp = now();
+    for friend in &friends {
+        connection
+            .execute(
+                "INSERT INTO friend_contacts (owner_uin,uin,nickname,remark,archived_at)
+                 VALUES (?1,?2,?3,?4,?5)
+                 ON CONFLICT(owner_uin,uin) DO UPDATE SET
+                   nickname=excluded.nickname, remark=excluded.remark, archived_at=excluded.archived_at",
+                params![owner_uin, friend.uin, friend.nickname, friend.remark, timestamp],
+            )
+            .map_err(|error| format!("保存好友失败：{error}"))?;
+    }
+    Ok(friends)
+}
+
+#[tauri::command]
+pub async fn list_friend_contacts(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+) -> Result<Vec<FriendContact>, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    let connection = open_database(&app)?;
+    let mut statement = connection
+        .prepare("SELECT uin,COALESCE(nickname,uin),remark FROM friend_contacts WHERE owner_uin=?1 ORDER BY uin ASC")
+        .map_err(|error| format!("读取好友列表失败：{error}"))?;
+    let rows = statement
+        .query_map(params![owner_uin], |row| {
+            Ok(FriendContact {
+                uin: row.get(0)?,
+                nickname: row.get(1)?,
+                remark: row.get(2)?,
+            })
+        })
+        .map_err(|error| format!("读取好友列表失败：{error}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析好友列表失败：{error}"))
+}
+
+// ---------- JSON / Markdown 导出 ----------
+
+/// 把 unix 秒格式化为本地时区的 "YYYY-MM-DD HH:mm"。
+/// 本地时区偏移经 chrono 获取并缓存（HTML 导出走浏览器 toLocaleString，这里需要服务端等价实现）。
+pub(crate) fn format_unix_time(seconds: i64) -> String {
+    use chrono::{Local, TimeZone};
+    static OFFSET: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    let offset = *OFFSET.get_or_init(|| Local::now().offset().local_minus_utc() as i64);
+    // Howard Hinnant 的 civil_from_days 算法，避免依赖 chrono 的完整格式化栈。
+    let seconds = seconds + offset;
+    let days = seconds.div_euclid(86_400);
+    let secs_of_day = seconds.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
+        secs_of_day / 3_600,
+        (secs_of_day % 3_600) / 60
+    )
+}
+
+fn markdown_for_items(items: &[ArchiveItem], category_name: &str, owner_uin: &str) -> String {
+    let mut document = String::new();
+    document.push_str(&format!(
+        "# QQ空间归档 · {category_name}\n\n账号 {owner} · 共 {count} 条\n\n---\n\n",
+        category_name = category_name,
+        owner = html_escape(owner_uin),
+        count = items.len(),
+    ));
+    for item in items {
+        let author = item
+            .author_name
+            .as_deref()
+            .or(item.author_uin.as_deref())
+            .unwrap_or("QQ 用户");
+        document.push_str(&format!("## {author}\n\n",));
+        if let Some(uin) = &item.author_uin {
+            document.push_str(&format!("QQ {uin} · "));
+        }
+        document.push_str(&format_unix_time(item.published_at));
+        document.push_str("\n\n");
+        if let Some(content) = item
+            .content
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+        {
+            document.push_str(content.trim_start_matches(['：', ':']).trim());
+            document.push_str("\n\n");
+        }
+        for (index, url) in item.picture_urls.iter().enumerate() {
+            document.push_str(&format!("![图片 {}]({})\n", index + 1, url));
+        }
+        if let Some(video) = &item.video_url {
+            document.push_str(&format!("[▶ 视频]({video})\n"));
+        }
+        if !item.likes.is_empty() {
+            let names = item
+                .likes
+                .iter()
+                .take(10)
+                .map(|like| {
+                    like.nickname
+                        .as_deref()
+                        .or(like.uin.as_deref())
+                        .unwrap_or("QQ用户")
+                })
+                .collect::<Vec<_>>()
+                .join("、");
+            document.push_str(&format!(
+                "\n♥ {}{}\n",
+                names,
+                if item.likes.len() > 10 {
+                    format!(" 等 {} 人", item.like_count)
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        for comment in &item.comments {
+            let name = comment.nickname.as_deref().unwrap_or("QQ 用户");
+            document.push_str(&format!(
+                "\n- **{name}**（{}）：{}",
+                format_unix_time(comment.created_at),
+                comment.content.replace('\n', "\n  ")
+            ));
+            for reply in &comment.replies {
+                let reply_name = reply.nickname.as_deref().unwrap_or("QQ 用户");
+                match reply.reply_to_nickname.as_deref() {
+                    Some(target) => document.push_str(&format!(
+                        "\n  - **{reply_name}** 回复 **{target}**：{}",
+                        reply.content.replace('\n', "\n    ")
+                    )),
+                    None => document.push_str(&format!(
+                        "\n  - **{reply_name}**：{}",
+                        reply.content.replace('\n', "\n    ")
+                    )),
+                }
+            }
+        }
+        document.push_str("\n\n---\n\n");
+    }
+    document
+}
+
+#[tauri::command]
+pub async fn export_archived_json(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    category: String,
+    ids: Option<Vec<i64>>,
+) -> Result<String, String> {
+    validate_category(&category)?;
+    let owner_uin = login.qzone_auth().await?.uin;
+    let selected = ids.map(|values| values.into_iter().collect::<HashSet<_>>());
+    let connection = open_database(&app)?;
+    let items = archive_items_for_export(&connection, &owner_uin, &category, selected.as_ref())?;
+    if items.is_empty() {
+        return Err("当前分类没有可以导出的归档".into());
+    }
+    let payload = json!({
+        "owner": owner_uin,
+        "category": category,
+        "exportedAt": now(),
+        "count": items.len(),
+        "items": items,
+    });
+    serde_json::to_string_pretty(&payload).map_err(|error| format!("序列化 JSON 失败：{error}"))
+}
+
+#[tauri::command]
+pub async fn export_archived_markdown(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    category: String,
+    ids: Option<Vec<i64>>,
+) -> Result<String, String> {
+    validate_category(&category)?;
+    let owner_uin = login.qzone_auth().await?.uin;
+    let selected = ids.map(|values| values.into_iter().collect::<HashSet<_>>());
+    let connection = open_database(&app)?;
+    let items = archive_items_for_export(&connection, &owner_uin, &category, selected.as_ref())?;
+    if items.is_empty() {
+        return Err("当前分类没有可以导出的归档".into());
+    }
+    let category_name = match category.as_str() {
+        "self" => "本人动态",
+        "other" => "其他动态",
+        _ => "留言",
+    };
+    Ok(markdown_for_items(&items, category_name, &owner_uin))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_feed_cursor, archive_page_delay_ms, checkpoint_is_stale, comment_from_values,
-        health_message, merge_comments, parse_feed, parse_feed_cursor, serialize_query_pairs,
-        skip_probe_offsets, ArchiveCheckpoint, FeedCursorDetails,
+        advance_feed_cursor, archive_page_delay_ms, checkpoint_is_stale, parse_feed,
+        parse_feed_cursor, serialize_query_pairs, skip_probe_offsets, ArchiveCheckpoint,
+        FeedCursorDetails,
+    };
+    use super::{
+        comment_from_values, format_unix_time, health_message, merge_comments, parse_friend_list,
+        parse_guestbook_page, reply_comments_json, GuestbookReply,
     };
     use serde_json::json;
+
+    #[test]
+    fn parses_guestbook_entry_and_replies() {
+        let page = json!({"code":0,"data":{"total":3,"commentList":[
+            {"id":"1001","uin":12345,"nickname":"老同学","content":"好久不见！","time":1600000000,
+             "replyList":[
+                {"uin":67890,"nickname":"主人","content":"是啊","time":1600000300},
+                {"uin":12345,"nickname":"老同学","content":"改天聚聚","time":1600000600,"replyName":"主人"}
+             ]}
+        ]}});
+        let (total, entries) = parse_guestbook_page(&page);
+        assert_eq!(total, 3);
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.key, "1001");
+        assert_eq!(entry.author_uin.as_deref(), Some("12345"));
+        assert_eq!(entry.author_name.as_deref(), Some("老同学"));
+        assert_eq!(entry.content, "好久不见！");
+        assert_eq!(entry.time, 1600000000);
+        assert_eq!(entry.replies.len(), 2);
+        assert_eq!(entry.replies[1].reply_to.as_deref(), Some("主人"));
+    }
+
+    #[test]
+    fn guestbook_entry_without_id_falls_back_to_stable_hash() {
+        let page = json!({"code":0,"data":{"commentList":[
+            {"uin":1,"nickname":"a","content":"hello","time":1},
+            {"uin":1,"nickname":"a","content":"hello","time":1}
+        ]}});
+        let (_, entries) = parse_guestbook_page(&page);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].key, entries[1].key,
+            "相同内容应得到相同兜底键以便去重"
+        );
+    }
+
+    #[test]
+    fn guestbook_reply_json_carries_reply_target_in_prefix() {
+        let reply = GuestbookReply {
+            uin: Some("1".into()),
+            nickname: Some("甲".into()),
+            reply_to: Some("乙".into()),
+            content: "好的".into(),
+            time: 123,
+        };
+        let parsed = serde_json::from_str::<serde_json::Value>(&reply_comments_json(&reply))
+            .expect("合成 JSON 应可解析");
+        assert_eq!(parsed["main_comment"]["user"]["nickname"], "甲");
+        let content = parsed["main_comment"]["content"].as_str().unwrap();
+        assert!(content.contains("回复 @乙") && content.contains("好的"));
+        assert!(parsed["main_comment"]["replys"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn parses_friend_list_shapes() {
+        let h5 = json!({"code":0,"data":{"itemsList":[
+            {"uin":10001,"nickname":"张三","remark":"同学"},
+            {"uin":0,"nickname":"无效"},
+            {"uin":10002,"nickname":"李四"}
+        ]}});
+        let friends = parse_friend_list(&h5);
+        assert_eq!(friends.len(), 2);
+        assert_eq!(friends[0].uin, "10001");
+        assert_eq!(friends[0].remark.as_deref(), Some("同学"));
+        let legacy = json!({"code":0,"data":{"list":[{"uin":"20002","nick":"王五"}]}});
+        let friends = parse_friend_list(&legacy);
+        assert_eq!(friends.len(), 1);
+        assert_eq!(friends[0].nickname, "王五");
+    }
+
+    #[test]
+    fn formats_unix_time_as_civil_date() {
+        // 与 chrono 的本地时区结果交叉验证，避免手写历法算法漂移。
+        use chrono::{Local, TimeZone};
+        for seconds in [0_i64, 1_600_000_000, 951_782_400, 4_102_444_800] {
+            let expected = Local
+                .timestamp_opt(seconds, 0)
+                .unwrap()
+                .format("%Y-%m-%d %H:%M")
+                .to_string();
+            assert_eq!(format_unix_time(seconds), expected, "seconds={seconds}");
+        }
+    }
 
     #[test]
     fn parses_like_event_sample_shape() {

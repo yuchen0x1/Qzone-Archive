@@ -12,7 +12,8 @@ import Paginator, { type PageState } from "primevue/paginator";
 import QzoneText from "../components/QzoneText.vue";
 import { loadRemoteImageBlob } from "../utils/archiveImage";
 import { useAuthStore } from "../stores/auth";
-import { clearArchivedFeeds, countArchivedFeeds, deleteArchivedFeeds, exportArchivePackage, exportArchivedHtml, listArchivedFeeds, loadArchivedImage, loadArchivedVideo, type ArchiveCategory, type ArchiveItem, type ExportPackageStats } from "../utils/qzone";
+import { clearArchivedFeeds, countArchivedFeeds, deleteArchivedFeeds, exportArchivePackage, exportArchivedHtml, exportArchivedJson, exportArchivedMarkdown, listArchivedFeeds, loadArchivedImage, loadArchivedVideo, syncGuestbookPage, type ArchiveCategory, type ArchiveItem, type ExportPackageStats } from "../utils/qzone";
+import { getArchiveInterval } from "../utils/appSettings";
 
 type DeleteAction = "selected" | "all";
 const authStore = useAuthStore();
@@ -239,6 +240,62 @@ function formatPackageSize(bytes: number) {
   return bytes >= 1024 * 1024 * 1024 ? `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB` : bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
 function openPackageDialog() { pkgResult.value = undefined; packageVisible.value = true; }
+
+const gbSyncing = ref(false);
+const gbMessage = ref("");
+let gbCancelRequested = false;
+async function syncFullGuestbook() {
+  if (gbSyncing.value) { gbCancelRequested = true; return; }
+  gbSyncing.value = true;
+  gbCancelRequested = false;
+  gbMessage.value = "正在同步完整留言板…";
+  error.value = "";
+  try {
+    let start = 0;
+    for (;;) {
+      if (gbCancelRequested) break;
+      const page = await syncGuestbookPage(start, 20);
+      start += 20;
+      gbMessage.value = page.total > 0
+        ? `已读取 ${Math.min(start, page.total)} / ${page.total} 条留言`
+        : `已读取 ${start} 条留言`;
+      if (page.fetched === 0) break;
+      await new Promise((resolve) => setTimeout(resolve, getArchiveInterval()));
+    }
+    await load();
+    gbMessage.value = gbCancelRequested ? "留言板同步已停止，再次点击可继续" : "留言板同步完成";
+  } catch (reason) {
+    error.value = `同步留言板失败：${String(reason)}`;
+    gbMessage.value = "";
+  } finally { gbSyncing.value = false; }
+}
+
+const exportingJson = ref(false);
+const exportingMarkdown = ref(false);
+async function exportSingleFile(kind: "json" | "md") {
+  const exporting = kind === "json" ? exportingJson : exportingMarkdown;
+  if (exporting.value) return;
+  exporting.value = true; error.value = "";
+  try {
+    const ids = selectedIds.value.length ? selectedIds.value : undefined;
+    const content = kind === "json"
+      ? await exportArchivedJson(category.value, ids)
+      : await exportArchivedMarkdown(category.value, ids);
+    const date = new Date().toISOString().slice(0, 10);
+    const path = await save(kind === "json"
+      ? {
+          defaultPath: `QQ空间归档-${categoryLabel.value}-${date}.json`,
+          filters: [{ name: "JSON 数据", extensions: ["json"] }],
+        }
+      : {
+          defaultPath: `QQ空间归档-${categoryLabel.value}-${date}.md`,
+          filters: [{ name: "Markdown 文档", extensions: ["md", "markdown"] }],
+        });
+    if (!path) return;
+    await writeFile(path, new TextEncoder().encode(content));
+  } catch (reason) { error.value = `导出失败：${String(reason)}`; }
+  finally { exporting.value = false; }
+}
 async function exportPackage() {
   if (pkgExporting.value || !pkgCategories.value.length) return;
   pkgExporting.value = true; error.value = "";
@@ -299,6 +356,7 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
       <Button icon="pi pi-refresh" label="刷新" severity="secondary" text :loading="loading" @click="load" />
       <Button icon="pi pi-file-export" label="导出全部" severity="secondary" text :loading="exporting" :disabled="!totalRecords || loading" @click="exportHtml(false)" />
       <Button icon="pi pi-box" label="导出离线包" severity="secondary" text :disabled="loading" @click="openPackageDialog" />
+      <Button v-if="category === 'guestbook'" icon="pi pi-comments" :label="gbSyncing ? '停止同步' : '同步完整留言板'" severity="secondary" text :class="{ 'gb-syncing': gbSyncing }" @click="syncFullGuestbook" />
       <Button icon="pi pi-trash" label="清空归档" severity="danger" text :disabled="!totalRecords || loading" @click="askDelete('all')" />
     </div>
   </section>
@@ -324,6 +382,7 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
   </section>
 
   <p v-if="error" class="archive-error"><i class="pi pi-exclamation-circle" />{{ error }}</p>
+  <p v-if="gbMessage" class="archive-error is-info"><i class="pi pi-spin pi-spinner" v-if="gbSyncing" /><i class="pi pi-check-circle" v-else />{{ gbMessage }}</p>
   <section v-if="filtered.length" class="archive-list">
     <article v-for="item in filtered" :key="item.id" class="surface-card archive-card" :class="{ 'archive-card-selected': selectedIds.includes(item.id) }">
       <Checkbox v-model="selectedIds" class="archive-checkbox" :input-id="`archive-${item.id}`" :value="item.id" />
@@ -377,19 +436,27 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
     <template #footer><Button label="取消" severity="secondary" text :disabled="deleting" @click="confirmVisible = false" /><Button label="确认删除" icon="pi pi-trash" severity="danger" :loading="deleting" @click="confirmDelete" /></template>
   </Dialog>
 
-  <Dialog v-model:visible="packageVisible" modal :closable="!pkgExporting" :draggable="false" class="package-dialog" header="导出离线包（含本地媒体）">
+  <Dialog v-model:visible="packageVisible" modal :closable="!pkgExporting" :draggable="false" class="package-dialog" header="导出归档内容">
     <div class="package-form">
-      <p class="package-intro">生成一个可直接离线打开的 ZIP：HTML 页面 + 已缓存图片/视频 + 结构化 data.json。未缓存的媒体会保留原始链接。</p>
+      <p class="package-intro">离线包生成一个可直接离线打开的 ZIP：HTML 页面 + 已缓存图片/视频 + 结构化 data.json。未缓存的媒体会保留原始链接。</p>
       <fieldset class="package-fieldset">
-        <legend>动态分类</legend>
+        <legend>离线包 · 动态分类</legend>
         <label v-for="option in pkgCategoryOptions" :key="option.value" class="package-check"><Checkbox v-model="pkgCategories" :value="option.value" :input-id="`pkg-${option.value}`" />{{ option.label }}</label>
       </fieldset>
       <fieldset class="package-fieldset">
-        <legend>包含内容</legend>
+        <legend>离线包 · 包含内容</legend>
         <label class="package-check"><Checkbox v-model="pkgIncludeAlbums" binary :input-id="`pkg-albums`" />相册照片（已备份的相册）</label>
         <label class="package-check"><Checkbox v-model="pkgIncludeMedia" binary :input-id="`pkg-media`" />把本地已缓存的图片/视频打包进文件（关闭则保留外链）</label>
       </fieldset>
-      <p v-if="!pkgCategories.length && !pkgIncludeAlbums" class="package-warn"><i class="pi pi-exclamation-triangle" />请至少选择一个动态分类或包含相册。</p>
+      <fieldset class="package-fieldset">
+        <legend>单文件格式（当前分类{{ selectedIds.length ? ` · 已选 ${selectedIds.length} 条` : "" }}）</legend>
+        <div class="package-single-actions">
+          <Button label="导出 JSON" icon="pi pi-file-excel" severity="secondary" outlined size="small" :loading="exportingJson" @click="exportSingleFile('json')" />
+          <Button label="导出 Markdown" icon="pi pi-file-edit" severity="secondary" outlined size="small" :loading="exportingMarkdown" @click="exportSingleFile('md')" />
+        </div>
+        <small class="package-hint">含评论、回复与点赞名单；JSON 为结构化原始数据，Markdown 适合打印与阅读。</small>
+      </fieldset>
+      <p v-if="!pkgCategories.length" class="package-warn"><i class="pi pi-exclamation-triangle" />离线包需要至少选择一个动态分类。</p>
       <div v-if="pkgResult" class="package-result">
         <p><i class="pi pi-check-circle" />导出完成：<strong>{{ pkgResult.targetPath }}</strong></p>
         <small>动态 {{ pkgResult.dynamicCount }} 条 · 相册 {{ pkgResult.albumCount }} 个 · HTML {{ pkgResult.htmlFiles }} 个 · 媒体文件 {{ pkgResult.mediaFiles }} 个 · 总大小 {{ formatPackageSize(pkgResult.totalBytes) }}</small>
@@ -397,7 +464,7 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
     </div>
     <template #footer>
       <Button label="关闭" severity="secondary" text :disabled="pkgExporting" @click="packageVisible = false" />
-      <Button label="选择位置并导出" icon="pi pi-box" :loading="pkgExporting" :disabled="!pkgCategories.length" @click="exportPackage" />
+      <Button label="选择位置并导出离线包" icon="pi pi-box" :loading="pkgExporting" :disabled="!pkgCategories.length" @click="exportPackage" />
     </template>
   </Dialog>
   <Teleport to="body">

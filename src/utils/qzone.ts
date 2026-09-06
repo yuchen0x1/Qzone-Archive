@@ -73,6 +73,14 @@ export const recoverRecyclePhotos = (pwd2sig: string, sourceAlbumId: string, tar
   invoke<Record<string, unknown>>("recover_recycle_photos", { pwd2sig, sourceAlbumId, targetAlbumId, photoIds });
 export const loadRecyclePhotoPreview = (imageUrl: string) => invoke<string>("load_recycle_photo_preview", { imageUrl });
 
+export interface GuestbookSyncPage { fetched: number; saved: number; total: number; }
+export const syncGuestbookPage = (start: number, num = 20) => invoke<GuestbookSyncPage>("save_guestbook_page", { start, num });
+export interface FriendContact { uin: string; nickname: string; remark?: string; }
+export const syncFriendList = () => invoke<FriendContact[]>("sync_friend_list");
+export const listFriendContacts = () => invoke<FriendContact[]>("list_friend_contacts");
+export const exportArchivedJson = (category: ArchiveCategory, ids?: number[]) => invoke<string>("export_archived_json", { category, ids });
+export const exportArchivedMarkdown = (category: ArchiveCategory, ids?: number[]) => invoke<string>("export_archived_markdown", { category, ids });
+
 export type AlbumBackupStatus = "idle" | "running" | "completed" | "cancelled" | "limited" | "error";
 export interface AlbumProgress { status: AlbumBackupStatus; message: string; albumsTotal: number; albumsDone: number; photosTotal: number; photosDone: number; photosFailed: number; retryAt?: number; }
 export interface AlbumSummary {
