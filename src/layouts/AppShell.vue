@@ -30,14 +30,15 @@ const showQzoneButton = computed(() => {
 const navigation = [
   { label: "概览", icon: "pi pi-home", to: "/" },
   { label: "归档", icon: "pi pi-inbox", to: "/archives" },
+  { label: "相册", icon: "pi pi-camera", to: "/albums" },
   { label: "联系人", icon: "pi pi-users", to: "/contacts" },
   { label: "媒体", icon: "pi pi-images", to: "/media" },
   { label: "任务", icon: "pi pi-sync", to: "/tasks" },
   { label: "回收站", icon: "pi pi-trash", to: "/recycle-bin" },
 ];
 const settingsItem = { label: "设置", icon: "pi pi-cog", to: "/settings" };
-const mobileNavigation = [navigation[0], navigation[1], navigation[3], navigation[4]];
-const mobileMoreNavigation = [navigation[2], settingsItem];
+const mobileNavigation = [navigation[0], navigation[1], navigation[2], navigation[4]];
+const mobileMoreNavigation = [navigation[3], navigation[5], settingsItem];
 const moreActive = computed(() => mobileMoreNavigation.some((item) => item.to === route.path));
 function qzoneUrl() {
   const uin = user.value?.uin;

@@ -12,7 +12,7 @@ import Paginator, { type PageState } from "primevue/paginator";
 import QzoneText from "../components/QzoneText.vue";
 import { loadRemoteImageBlob } from "../utils/archiveImage";
 import { useAuthStore } from "../stores/auth";
-import { clearArchivedFeeds, countArchivedFeeds, deleteArchivedFeeds, exportArchivedHtml, listArchivedFeeds, loadArchivedImage, loadArchivedVideo, type ArchiveCategory, type ArchiveItem } from "../utils/qzone";
+import { clearArchivedFeeds, countArchivedFeeds, deleteArchivedFeeds, exportArchivePackage, exportArchivedHtml, listArchivedFeeds, loadArchivedImage, loadArchivedVideo, type ArchiveCategory, type ArchiveItem, type ExportPackageStats } from "../utils/qzone";
 
 type DeleteAction = "selected" | "all";
 const authStore = useAuthStore();
@@ -223,6 +223,36 @@ async function exportHtml(selectedOnly: boolean) {
   } catch (reason) { error.value = `导出失败：${String(reason)}`; }
   finally { exporting.value = false; }
 }
+
+const packageVisible = ref(false);
+const pkgIncludeAlbums = ref(true);
+const pkgIncludeMedia = ref(true);
+const pkgExporting = ref(false);
+const pkgResult = ref<ExportPackageStats>();
+const pkgCategories = ref<ArchiveCategory[]>(["self", "other", "guestbook"]);
+const pkgCategoryOptions: { label: string; value: ArchiveCategory }[] = [
+  { label: "本人动态", value: "self" },
+  { label: "其他动态", value: "other" },
+  { label: "留言", value: "guestbook" },
+];
+function formatPackageSize(bytes: number) {
+  return bytes >= 1024 * 1024 * 1024 ? `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB` : bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+function openPackageDialog() { pkgResult.value = undefined; packageVisible.value = true; }
+async function exportPackage() {
+  if (pkgExporting.value || !pkgCategories.value.length) return;
+  pkgExporting.value = true; error.value = "";
+  try {
+    const date = new Date().toISOString().slice(0, 10);
+    const path = await save({
+      defaultPath: `QQ空间归档-离线包-${date}.zip`,
+      filters: [{ name: "ZIP 压缩包", extensions: ["zip"] }],
+    });
+    if (!path) return;
+    pkgResult.value = await exportArchivePackage(path, pkgCategories.value, pkgIncludeAlbums.value, pkgIncludeMedia.value);
+  } catch (reason) { error.value = `导出离线包失败：${String(reason)}`; packageVisible.value = false; }
+  finally { pkgExporting.value = false; }
+}
 async function loadVideo(item: ArchiveItem) {
   if (!item.videoUrl || videoLoading[item.id]) return;
   videoLoading[item.id] = true; delete videoErrors[item.id];
@@ -268,6 +298,7 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
     <div class="archive-header-actions">
       <Button icon="pi pi-refresh" label="刷新" severity="secondary" text :loading="loading" @click="load" />
       <Button icon="pi pi-file-export" label="导出全部" severity="secondary" text :loading="exporting" :disabled="!totalRecords || loading" @click="exportHtml(false)" />
+      <Button icon="pi pi-box" label="导出离线包" severity="secondary" text :disabled="loading" @click="openPackageDialog" />
       <Button icon="pi pi-trash" label="清空归档" severity="danger" text :disabled="!totalRecords || loading" @click="askDelete('all')" />
     </div>
   </section>
@@ -344,6 +375,30 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
   <Dialog v-model:visible="confirmVisible" modal :closable="!deleting" :draggable="false" class="delete-dialog" :header="confirmTitle">
     <div class="delete-dialog-content"><span class="delete-warning"><i class="pi pi-trash" /></span><div><p>{{ confirmDescription }}</p><small>此操作无法撤销，请确认后继续。</small></div></div>
     <template #footer><Button label="取消" severity="secondary" text :disabled="deleting" @click="confirmVisible = false" /><Button label="确认删除" icon="pi pi-trash" severity="danger" :loading="deleting" @click="confirmDelete" /></template>
+  </Dialog>
+
+  <Dialog v-model:visible="packageVisible" modal :closable="!pkgExporting" :draggable="false" class="package-dialog" header="导出离线包（含本地媒体）">
+    <div class="package-form">
+      <p class="package-intro">生成一个可直接离线打开的 ZIP：HTML 页面 + 已缓存图片/视频 + 结构化 data.json。未缓存的媒体会保留原始链接。</p>
+      <fieldset class="package-fieldset">
+        <legend>动态分类</legend>
+        <label v-for="option in pkgCategoryOptions" :key="option.value" class="package-check"><Checkbox v-model="pkgCategories" :value="option.value" :input-id="`pkg-${option.value}`" />{{ option.label }}</label>
+      </fieldset>
+      <fieldset class="package-fieldset">
+        <legend>包含内容</legend>
+        <label class="package-check"><Checkbox v-model="pkgIncludeAlbums" binary :input-id="`pkg-albums`" />相册照片（已备份的相册）</label>
+        <label class="package-check"><Checkbox v-model="pkgIncludeMedia" binary :input-id="`pkg-media`" />把本地已缓存的图片/视频打包进文件（关闭则保留外链）</label>
+      </fieldset>
+      <p v-if="!pkgCategories.length && !pkgIncludeAlbums" class="package-warn"><i class="pi pi-exclamation-triangle" />请至少选择一个动态分类或包含相册。</p>
+      <div v-if="pkgResult" class="package-result">
+        <p><i class="pi pi-check-circle" />导出完成：<strong>{{ pkgResult.targetPath }}</strong></p>
+        <small>动态 {{ pkgResult.dynamicCount }} 条 · 相册 {{ pkgResult.albumCount }} 个 · HTML {{ pkgResult.htmlFiles }} 个 · 媒体文件 {{ pkgResult.mediaFiles }} 个 · 总大小 {{ formatPackageSize(pkgResult.totalBytes) }}</small>
+      </div>
+    </div>
+    <template #footer>
+      <Button label="关闭" severity="secondary" text :disabled="pkgExporting" @click="packageVisible = false" />
+      <Button label="选择位置并导出" icon="pi pi-box" :loading="pkgExporting" :disabled="!pkgCategories.length" @click="exportPackage" />
+    </template>
   </Dialog>
   <Teleport to="body">
     <Transition name="image-viewer">

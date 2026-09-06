@@ -28,6 +28,12 @@ const router = createRouter({
       meta: { title: "媒体" },
     },
     {
+      path: "/albums",
+      name: "albums",
+      component: () => import("../views/AlbumsView.vue"),
+      meta: { title: "相册备份" },
+    },
+    {
       path: "/tasks",
       name: "tasks",
       component: () => import("../views/TasksView.vue"),

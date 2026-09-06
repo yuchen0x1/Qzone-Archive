@@ -23,6 +23,8 @@ const RECOVER_ALBUM_URL: &str =
     "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/cgi-bin/common/cgi_recover_album_v2";
 const ALBUM_LIST_URL: &str =
     "https://h5.qzone.qq.com/proxy/domain/photo.qzone.qq.com/fcgi-bin/fcg_list_album_v3";
+const PHOTO_LIST_URL: &str =
+    "https://h5.qzone.qq.com/proxy/domain/photo.qzone.qq.com/fcgi-bin/fcg_list_photo_v3";
 const CREATE_ALBUM_URL: &str =
     "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/cgi-bin/common/cgi_add_album_v2";
 
@@ -560,8 +562,7 @@ pub async fn load_recycle_photo_preview(
     ))
 }
 
-#[tauri::command]
-pub async fn list_qzone_albums(state: tauri::State<'_, QLoginState>) -> Result<Value, String> {
+pub(crate) async fn fetch_album_list_json(state: &QLoginState) -> Result<Value, String> {
     let auth = state.qzone_auth().await?;
     let request_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -606,6 +607,69 @@ pub async fn list_qzone_albums(state: tauri::State<'_, QLoginState>) -> Result<V
         .map_err(|error| format!("读取相册列表响应失败：{error}"))?;
     if !status.is_success() {
         return Err(format!("获取相册列表失败：HTTP {status}"));
+    }
+    ensure_qzone_success(parse_qzone_json(&text)?)
+}
+
+#[tauri::command]
+pub async fn list_qzone_albums(state: tauri::State<'_, QLoginState>) -> Result<Value, String> {
+    fetch_album_list_json(&state).await
+}
+
+pub(crate) async fn fetch_photo_page(
+    state: &QLoginState,
+    album_id: &str,
+    page_start: u32,
+    page_num: u32,
+) -> Result<Value, String> {
+    if album_id.trim().is_empty() {
+        return Err("缺少相册 ID".into());
+    }
+    let auth = state.qzone_auth().await?;
+    let request_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .rem_euclid(1_000_000_000)
+        .to_string();
+    let query = vec![
+        ("g_tk", auth.g_tk.to_string()),
+        ("t", request_id),
+        ("hostUin", auth.uin.clone()),
+        ("uin", auth.uin.clone()),
+        ("albumid", album_id.to_owned()),
+        ("appid", "4".into()),
+        ("inCharset", "utf-8".into()),
+        ("outCharset", "utf-8".into()),
+        ("source", "qzone".into()),
+        ("plat", "qzone".into()),
+        ("format", "jsonp".into()),
+        ("notice", "0".into()),
+        ("mode", "2".into()),
+        ("sortOrder", "4".into()),
+        ("pageStart", page_start.to_string()),
+        ("pageNum", page_num.to_string()),
+        ("idcNum", "4".into()),
+        ("callbackFun", "shine0".into()),
+    ];
+    let response = state
+        .client()
+        .get(PHOTO_LIST_URL)
+        .query(&query)
+        .header(ACCEPT, "application/json, text/javascript, */*; q=0.01")
+        .header(REFERER, "https://user.qzone.qq.com/")
+        .header(USER_AGENT, &auth.user_agent)
+        .header(COOKIE, &auth.cookie_header)
+        .send()
+        .await
+        .map_err(|error| format!("获取相册照片列表失败：{error}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("读取相册照片列表响应失败：{error}"))?;
+    if !status.is_success() {
+        return Err(format!("获取相册照片列表失败：HTTP {status}"));
     }
     ensure_qzone_success(parse_qzone_json(&text)?)
 }

@@ -49,7 +49,7 @@ export const countArchivedFeeds = (category: ArchiveCategory = "self") => invoke
 export const exportArchivedHtml = (category: ArchiveCategory, ids?: number[]) => invoke<string>("export_archived_html", { category, ids });
 export const loadArchivedImage = (id: number, pictureIndex: number) => invoke<string>("load_archived_image", { id, pictureIndex });
 export const loadArchivedVideo = (id: number) => invoke<string>("load_archived_video", { id });
-export interface ArchiveOverview { dynamics: number; pictures: number; comments: number; likes: number; databaseBytes: number; }
+export interface ArchiveOverview { dynamics: number; pictures: number; comments: number; likes: number; albums: number; albumPhotosBacked: number; databaseBytes: number; }
 export const getArchiveOverview = () => invoke<ArchiveOverview>("get_archive_overview");
 export interface ArchiveHealth { healthy: boolean; integrity: string; schemaVersion: number; dynamics: number; interactions: number; pendingSkips: number; databaseBytes: number; message: string; }
 export const checkArchiveHealth = () => invoke<ArchiveHealth>("check_archive_health");
@@ -72,3 +72,27 @@ export const recoverRecycleAlbum = (pwd2sig: string, albumId: string) => invoke<
 export const recoverRecyclePhotos = (pwd2sig: string, sourceAlbumId: string, targetAlbumId: string, photoIds: string[]) =>
   invoke<Record<string, unknown>>("recover_recycle_photos", { pwd2sig, sourceAlbumId, targetAlbumId, photoIds });
 export const loadRecyclePhotoPreview = (imageUrl: string) => invoke<string>("load_recycle_photo_preview", { imageUrl });
+
+export type AlbumBackupStatus = "idle" | "running" | "completed" | "cancelled" | "limited" | "error";
+export interface AlbumProgress { status: AlbumBackupStatus; message: string; albumsTotal: number; albumsDone: number; photosTotal: number; photosDone: number; photosFailed: number; retryAt?: number; }
+export interface AlbumSummary {
+  albumId: string; name: string; description?: string; coverUrl?: string; photoTotal: number;
+  createTime?: number; modifyTime?: number; local: boolean; backedCount: number; failedCount: number; localStatus?: string;
+}
+export interface AlbumPhoto {
+  id: number; albumId: string; picKey: string; name?: string; description?: string; uploadTime?: number;
+  previewUrl?: string; url?: string; localPath?: string; fileSize: number; status: "pending" | "done" | "failed"; error?: string;
+}
+export interface AlbumPhotoPage { items: AlbumPhoto[]; total: number; }
+export const startAlbumBackup = (intervalMs: number, albumIds?: string[]) => invoke<AlbumProgress>("start_album_backup", { intervalMs, albumIds });
+export const getAlbumProgress = () => invoke<AlbumProgress>("get_album_progress");
+export const cancelAlbumBackup = () => invoke<void>("cancel_album_backup");
+export const listRemoteAlbums = () => invoke<AlbumSummary[]>("list_remote_albums");
+export const listArchivedAlbums = () => invoke<AlbumSummary[]>("list_archived_albums");
+export const listArchivedAlbumPhotos = (albumId: string, limit = 60, offset = 0) => invoke<AlbumPhotoPage>("list_archived_album_photos", { albumId, limit, offset });
+export const resetFailedAlbumPhotos = (albumId: string) => invoke<number>("reset_failed_album_photos", { albumId });
+export const deleteArchivedAlbum = (albumId: string) => invoke<number>("delete_archived_album", { albumId });
+export const loadAlbumPhoto = (photoId: number) => invoke<string>("load_album_photo", { photoId });
+export interface ExportPackageStats { targetPath: string; dynamicCount: number; htmlFiles: number; mediaFiles: number; albumCount: number; totalBytes: number; }
+export const exportArchivePackage = (targetPath: string, categories: ArchiveCategory[], includeAlbums: boolean, includeMedia: boolean) =>
+  invoke<ExportPackageStats>("export_archive_package", { targetPath, categories, includeAlbums, includeMedia });

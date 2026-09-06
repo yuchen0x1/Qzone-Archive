@@ -14,7 +14,7 @@ import { getArchiveOverview, getArchiveProgress, getInteractionRanking, listArch
 const router = useRouter();
 const authStore = useAuthStore();
 const { loggedIn, user } = storeToRefs(authStore);
-const overview = ref<ArchiveOverview>({ dynamics: 0, pictures: 0, comments: 0, likes: 0, databaseBytes: 0 });
+const overview = ref<ArchiveOverview>({ dynamics: 0, pictures: 0, comments: 0, likes: 0, albums: 0, albumPhotosBacked: 0, databaseBytes: 0 });
 const progress = ref<ArchiveProgress>({ status: "idle", pages: 0, fetched: 0, saved: 0, skipped: 0, message: "尚未开始归档" });
 const recent = ref<ArchiveItem[]>([]);
 const ranking = ref<InteractionRank[]>([]);
@@ -49,7 +49,7 @@ async function loadAvatar(uin: string) {
 async function loadDashboard() {
   releaseAvatars();
   loadError.value = "";
-  if (!loggedIn.value) { overview.value = { dynamics: 0, pictures: 0, comments: 0, likes: 0, databaseBytes: 0 }; recent.value = []; ranking.value = []; return; }
+  if (!loggedIn.value) { overview.value = { dynamics: 0, pictures: 0, comments: 0, likes: 0, albums: 0, albumPhotosBacked: 0, databaseBytes: 0 }; recent.value = []; ranking.value = []; return; }
   loading.value = true;
   try {
     const [stats, items, task, ranks] = await Promise.all([getArchiveOverview(), listArchivedFeeds(3, 0), getArchiveProgress(), getInteractionRanking(8)]);
@@ -79,6 +79,7 @@ onBeforeUnmount(releaseAvatars);
     <StatCard label="动态" :value="String(overview.dynamics)" :hint="overview.dynamics ? '当前账号本地归档' : '等待首次归档'" icon="pi pi-comment" tone="blue" />
     <StatCard label="照片" :value="String(overview.pictures)" :hint="overview.pictures ? '动态图片总数' : '暂无归档图片'" icon="pi pi-images" tone="purple" />
     <StatCard label="评论" :value="String(overview.comments)" :hint="`${overview.likes} 个赞`" icon="pi pi-comments" tone="green" />
+    <StatCard label="相册照片" :value="String(overview.albumPhotosBacked)" :hint="overview.albums ? `已备份 ${overview.albums} 个相册` : '可在相册页备份'" icon="pi pi-camera" tone="teal" />
     <StatCard label="本地占用" :value="storageText" hint="SQLite 资料库" icon="pi pi-database" tone="orange" />
   </section>
   <section class="dashboard-grid">

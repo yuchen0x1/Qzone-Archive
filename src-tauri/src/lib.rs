@@ -1,4 +1,6 @@
+mod albums;
 mod archive;
+mod export;
 mod qlogin;
 mod qzone;
 mod updater;
@@ -12,6 +14,7 @@ fn exit_app(app: tauri::AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .manage(archive::ArchiveState::new())
+        .manage(albums::AlbumState::new())
         .manage(qlogin::QLoginState::new())
         .manage(qzone::RecycleAuthState::default())
         .plugin(tauri_plugin_http::init())
@@ -63,6 +66,16 @@ pub fn run() {
             archive::delete_archived_feeds,
             archive::clear_archived_feeds,
             archive::delete_all_app_data,
+            albums::start_album_backup,
+            albums::get_album_progress,
+            albums::cancel_album_backup,
+            albums::list_remote_albums,
+            albums::list_archived_albums,
+            albums::list_archived_album_photos,
+            albums::reset_failed_album_photos,
+            albums::delete_archived_album,
+            albums::load_album_photo,
+            export::export_archive_package,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

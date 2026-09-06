@@ -74,6 +74,14 @@ impl ArchiveState {
             image_downloads: tokio::sync::Semaphore::new(4),
         }
     }
+
+    /// 相册备份等兄弟模块用于避免与动态归档同时打接口。
+    pub(crate) fn is_feed_archive_running(&self) -> bool {
+        self.progress
+            .lock()
+            .map(|progress| progress.status == "running")
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Serialize)]
@@ -81,7 +89,7 @@ impl ArchiveState {
 pub struct ArchiveItem {
     #[serde(skip)]
     owner_uin: String,
-    id: i64,
+    pub(crate) id: i64,
     cell_id: String,
     published_at: i64,
     content: Option<String>,
@@ -145,6 +153,8 @@ pub struct ArchiveOverview {
     pictures: u64,
     comments: u64,
     likes: u64,
+    albums: u64,
+    album_photos_backed: u64,
     database_bytes: u64,
 }
 
@@ -244,7 +254,7 @@ pub struct ArchiveSkipRetryResult {
     recovered_records: u64,
 }
 
-fn stable_feed_hash(value: &Value) -> u64 {
+pub(crate) fn stable_feed_hash(value: &Value) -> u64 {
     // FNV-1a keeps fallback keys deterministic without adding a hashing dependency.
     value
         .to_string()
@@ -264,7 +274,7 @@ fn archive_page_delay_ms(interval_ms: u64) -> u64 {
     interval_ms + subsecond_nanos % (jitter_range + 1)
 }
 
-fn database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_data_dir()
@@ -275,9 +285,9 @@ fn database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 /// 数据库结构版本：仅在版本落后时执行一次建表与数据迁移；
 /// 否则归档循环里每页多次打开数据库都会重复执行 DDL 与全表扫描，库越大越慢。
-const DATABASE_SCHEMA_VERSION: i32 = 1;
+const DATABASE_SCHEMA_VERSION: i32 = 2;
 
-fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
+pub(crate) fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
     let mut connection = Connection::open(database_path(app)?)
         .map_err(|error| format!("无法打开归档数据库：{error}"))?;
     connection
@@ -364,7 +374,48 @@ fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
            resolved_at INTEGER,
            recovered_records INTEGER NOT NULL DEFAULT 0,
            UNIQUE(owner_uin, cursor_offset, base_time)
-         );",
+         );
+         CREATE TABLE IF NOT EXISTS archive_albums (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           owner_uin TEXT NOT NULL,
+           album_id TEXT NOT NULL,
+           name TEXT,
+           description TEXT,
+           cover_url TEXT,
+           photo_total INTEGER NOT NULL DEFAULT 0,
+           backed_count INTEGER NOT NULL DEFAULT 0,
+           failed_count INTEGER NOT NULL DEFAULT 0,
+           status TEXT NOT NULL DEFAULT 'pending',
+           create_time INTEGER,
+           modify_time INTEGER,
+           archived_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL,
+           UNIQUE(owner_uin, album_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_archive_albums_owner
+           ON archive_albums(owner_uin, modify_time DESC);
+         CREATE TABLE IF NOT EXISTS archive_album_photos (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           owner_uin TEXT NOT NULL,
+           album_id TEXT NOT NULL,
+           pic_key TEXT NOT NULL,
+           name TEXT,
+           description TEXT,
+           upload_time INTEGER,
+           preview_url TEXT,
+           urls_json TEXT NOT NULL,
+           local_path TEXT,
+           file_size INTEGER NOT NULL DEFAULT 0,
+           status TEXT NOT NULL DEFAULT 'pending',
+           error TEXT,
+           archived_at INTEGER NOT NULL,
+           updated_at INTEGER NOT NULL,
+           UNIQUE(owner_uin, album_id, pic_key)
+         );
+         CREATE INDEX IF NOT EXISTS idx_archive_album_photos_album
+           ON archive_album_photos(owner_uin, album_id, upload_time);
+         CREATE INDEX IF NOT EXISTS idx_archive_album_photos_status
+           ON archive_album_photos(owner_uin, album_id, status);",
         )
         .map_err(|error| format!("初始化归档数据库失败：{error}"))?;
     if connection
@@ -867,7 +918,10 @@ fn checkpoint_is_stale(checkpoint: &ArchiveCheckpoint, current: i64) -> bool {
     current.saturating_sub(checkpoint.updated_at) >= ARCHIVE_CURSOR_MAX_AGE_SECONDS
 }
 
-fn reserve_archive_page(app: &tauri::AppHandle, owner_uin: &str) -> Result<Option<i64>, String> {
+pub(crate) fn reserve_archive_page(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+) -> Result<Option<i64>, String> {
     let connection = open_database(app)?;
     let current = now();
     let state = connection.query_row(
@@ -1050,7 +1104,7 @@ fn picture_url_candidates(json: Option<String>) -> Vec<Vec<String>> {
         .collect()
 }
 
-fn picture_urls(json: Option<String>) -> Vec<String> {
+pub(crate) fn picture_urls(json: Option<String>) -> Vec<String> {
     picture_url_candidates(json)
         .into_iter()
         .filter_map(|urls| urls.into_iter().next())
@@ -1091,7 +1145,10 @@ fn is_qq_missing_image_placeholder(bytes: &[u8]) -> bool {
     })
 }
 
-fn existing_archived_image(image_dir: &std::path::Path, file_stem: &str) -> Option<PathBuf> {
+pub(crate) fn existing_archived_image(
+    image_dir: &std::path::Path,
+    file_stem: &str,
+) -> Option<PathBuf> {
     ["jpg", "png", "gif", "webp", "avif", "bmp"]
         .into_iter()
         .map(|extension| image_dir.join(format!("{file_stem}.{extension}")))
@@ -1111,6 +1168,130 @@ fn existing_archived_image(image_dir: &std::path::Path, file_stem: &str) -> Opti
         })
 }
 
+/// 归档图片目录：按账号隔离，动态图片与相册照片都存放在这里。
+pub(crate) fn archived_image_dir(app: &tauri::AppHandle, uin: &str) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法获取图片归档目录：{error}"))?
+        .join("images")
+        .join(uin);
+    fs::create_dir_all(&dir).map_err(|error| format!("无法创建图片归档目录：{error}"))?;
+    Ok(dir)
+}
+
+/// 视频缓存文件路径（按账号隔离）。
+pub(crate) fn video_cache_path(
+    app: &tauri::AppHandle,
+    uin: &str,
+    dynamic_id: i64,
+) -> Result<PathBuf, String> {
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("无法获取视频缓存目录：{error}"))?
+        .join("videos");
+    fs::create_dir_all(&cache_dir).map_err(|error| format!("无法创建视频缓存目录：{error}"))?;
+    Ok(cache_dir.join(format!("{uin}-{dynamic_id}.mp4")))
+}
+
+pub(crate) struct DownloadedImage {
+    pub bytes: Vec<u8>,
+    pub extension: &'static str,
+}
+
+/// 按“候选地址 + Cookie/Referer 组合矩阵”下载 QQ 图片，仅白名单域名会携带登录态，
+/// 并校验内容确为图片（拒绝占位图）。返回第一个成功的结果。
+pub(crate) async fn download_qzone_image(
+    auth: &crate::qlogin::QzoneAuth,
+    candidates: &[String],
+    client: &reqwest::Client,
+) -> Result<DownloadedImage, String> {
+    let mut last_error = String::new();
+    for url in candidates {
+        if !is_trusted_media_host(url) {
+            last_error = "跳过非 QQ 域名的图片地址".into();
+            continue;
+        }
+        for (with_cookie, with_referer) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let mut request = client
+                .get(url)
+                .header(reqwest::header::USER_AGENT, &auth.user_agent)
+                .header(
+                    reqwest::header::ACCEPT,
+                    "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8",
+                )
+                .header(
+                    reqwest::header::ACCEPT_LANGUAGE,
+                    "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5",
+                );
+            if with_cookie {
+                request = request.header(reqwest::header::COOKIE, &auth.cookie_header);
+            }
+            if with_referer {
+                request = request.header(reqwest::header::REFERER, "https://user.qzone.qq.com/");
+            }
+            match request.send().await {
+                Ok(response) if response.status().is_success() => {
+                    if response
+                        .content_length()
+                        .is_some_and(|length| length > 50 * 1024 * 1024)
+                    {
+                        last_error = "图片超过 50 MB 安全限制".into();
+                        continue;
+                    }
+                    match response.bytes().await {
+                        Ok(bytes) => {
+                            let Some(extension) = archived_image_extension(&bytes) else {
+                                last_error = "QQ 返回了非图片内容".into();
+                                continue;
+                            };
+                            if is_qq_missing_image_placeholder(&bytes) {
+                                last_error = "QQ 返回了图片不存在占位图".into();
+                                continue;
+                            }
+                            return Ok(DownloadedImage {
+                                bytes: bytes.to_vec(),
+                                extension,
+                            });
+                        }
+                        Err(error) => last_error = format!("读取图片数据失败：{error}"),
+                    }
+                }
+                Ok(response) => last_error = format!("HTTP {}", response.status()),
+                Err(error) => last_error = format!("请求图片失败：{error}"),
+            }
+        }
+    }
+    Err(format!("所有 QQ 图片地址均加载失败：{last_error}"))
+}
+
+/// 原子落盘：先写临时文件再改名，避免半张图片占用正式文件名导致续传误判。
+pub(crate) fn persist_downloaded_image(
+    image_dir: &std::path::Path,
+    file_stem: &str,
+    downloaded: &DownloadedImage,
+) -> Result<PathBuf, String> {
+    let path = image_dir.join(format!("{file_stem}.{}", downloaded.extension));
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = image_dir.join(format!("{file_stem}-{nonce}.part"));
+    fs::write(&temporary, &downloaded.bytes)
+        .map_err(|error| format!("写入图片归档失败：{error}"))?;
+    if let Err(error) = fs::rename(&temporary, &path) {
+        if !path.exists() {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("保存图片归档失败：{error}"));
+        }
+        let _ = fs::remove_file(&temporary);
+    }
+    Ok(path)
+}
+
 #[tauri::command]
 pub async fn load_archived_image(
     app: tauri::AppHandle,
@@ -1120,13 +1301,7 @@ pub async fn load_archived_image(
     picture_index: usize,
 ) -> Result<String, String> {
     let auth = login.qzone_auth().await?;
-    let image_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("无法获取图片归档目录：{error}"))?
-        .join("images")
-        .join(&auth.uin);
-    fs::create_dir_all(&image_dir).map_err(|error| format!("无法创建图片归档目录：{error}"))?;
+    let image_dir = archived_image_dir(&app, &auth.uin)?;
     let file_stem = format!("{id}-{picture_index}");
     if let Some(path) = existing_archived_image(&image_dir, &file_stem) {
         return Ok(path.to_string_lossy().into_owned());
@@ -1163,80 +1338,12 @@ pub async fn load_archived_image(
         .timeout(std::time::Duration::from_secs(90))
         .build()
         .map_err(|error| format!("创建图片请求客户端失败：{error}"))?;
-    let mut last_error = String::new();
-    for url in candidates {
-        if !is_trusted_media_host(&url) {
-            last_error = "跳过非 QQ 域名的图片地址".into();
-            continue;
-        }
-        for (with_cookie, with_referer) in
-            [(true, true), (true, false), (false, true), (false, false)]
-        {
-            let mut request = client
-                .get(&url)
-                .header(reqwest::header::USER_AGENT, &auth.user_agent)
-                .header(
-                    reqwest::header::ACCEPT,
-                    "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8",
-                )
-                .header(
-                    reqwest::header::ACCEPT_LANGUAGE,
-                    "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5",
-                );
-            if with_cookie {
-                request = request.header(reqwest::header::COOKIE, &auth.cookie_header);
-            }
-            if with_referer {
-                request = request.header(reqwest::header::REFERER, "https://user.qzone.qq.com/");
-            }
-            match request.send().await {
-                Ok(response) if response.status().is_success() => {
-                    if response
-                        .content_length()
-                        .is_some_and(|length| length > 50 * 1024 * 1024)
-                    {
-                        last_error = "图片超过 50 MB 安全限制".into();
-                        continue;
-                    }
-                    match response.bytes().await {
-                        Ok(bytes) => {
-                            let Some(extension) = archived_image_extension(&bytes) else {
-                                last_error = "QQ 返回了非图片内容".into();
-                                continue;
-                            };
-                            if is_qq_missing_image_placeholder(&bytes) {
-                                last_error = "QQ 返回了图片不存在占位图".into();
-                                continue;
-                            }
-                            let path = image_dir.join(format!("{file_stem}.{extension}"));
-                            let nonce = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_nanos();
-                            let temporary = image_dir.join(format!("{file_stem}-{nonce}.part"));
-                            fs::write(&temporary, &bytes)
-                                .map_err(|error| format!("写入图片归档失败：{error}"))?;
-                            if let Err(error) = fs::rename(&temporary, &path) {
-                                if !path.exists() {
-                                    let _ = fs::remove_file(&temporary);
-                                    return Err(format!("保存图片归档失败：{error}"));
-                                }
-                                let _ = fs::remove_file(&temporary);
-                            }
-                            return Ok(path.to_string_lossy().into_owned());
-                        }
-                        Err(error) => last_error = format!("读取图片数据失败：{error}"),
-                    }
-                }
-                Ok(response) => last_error = format!("HTTP {}", response.status()),
-                Err(error) => last_error = format!("请求图片失败：{error}"),
-            }
-        }
-    }
-    Err(format!("所有 QQ 图片地址均加载失败：{last_error}"))
+    let downloaded = download_qzone_image(&auth, &candidates, &client).await?;
+    let path = persist_downloaded_image(&image_dir, &file_stem, &downloaded)?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
-fn video_urls(json: Option<String>) -> Vec<String> {
+pub(crate) fn video_urls(json: Option<String>) -> Vec<String> {
     let Some(value) = json.and_then(|text| serde_json::from_str::<Value>(&text).ok()) else {
         return vec![];
     };
@@ -1257,7 +1364,7 @@ fn video_urls(json: Option<String>) -> Vec<String> {
     urls
 }
 
-fn video_cover_url(json: Option<String>) -> Option<String> {
+pub(crate) fn video_cover_url(json: Option<String>) -> Option<String> {
     let value = json.and_then(|text| serde_json::from_str::<Value>(&text).ok())?;
     value
         .pointer("/coverurl/0/url")
@@ -1279,13 +1386,7 @@ pub async fn load_archived_video(
     id: i64,
 ) -> Result<String, String> {
     let auth = login.qzone_auth().await?;
-    let cache_dir = app
-        .path()
-        .app_cache_dir()
-        .map_err(|error| format!("无法获取视频缓存目录：{error}"))?
-        .join("videos");
-    fs::create_dir_all(&cache_dir).map_err(|error| format!("无法创建视频缓存目录：{error}"))?;
-    let cache_path = cache_dir.join(format!("{}-{id}.mp4", auth.uin));
+    let cache_path = video_cache_path(&app, &auth.uin, id)?;
     if cache_path
         .metadata()
         .is_ok_and(|metadata| metadata.len() > 1024)
@@ -2517,14 +2618,14 @@ fn merge_comments(comments: impl IntoIterator<Item = ArchiveComment>) -> Vec<Arc
     merged
 }
 
-fn validate_category(category: &str) -> Result<(), String> {
+pub(crate) fn validate_category(category: &str) -> Result<(), String> {
     match category {
         "self" | "other" | "guestbook" => Ok(()),
         _ => Err("无效的归档分类".into()),
     }
 }
 
-fn html_escape(value: &str) -> String {
+pub(crate) fn html_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -2566,7 +2667,7 @@ fn qzone_text_html(value: Option<&str>) -> String {
     }
 }
 
-fn archive_items_for_export(
+pub(crate) fn archive_items_for_export(
     connection: &Connection,
     owner_uin: &str,
     category: &str,
@@ -2649,33 +2750,20 @@ fn archive_items_for_export(
     Ok(items)
 }
 
-#[tauri::command]
-pub async fn export_archived_html(
-    app: tauri::AppHandle,
-    login: tauri::State<'_, QLoginState>,
-    category: String,
-    ids: Option<Vec<i64>>,
-) -> Result<String, String> {
-    validate_category(&category)?;
-    let owner_uin = login.qzone_auth().await?.uin;
-    let selected = ids.map(|values| values.into_iter().collect::<HashSet<_>>());
-    if selected.as_ref().is_some_and(HashSet::is_empty) {
-        return Err("请先选择需要导出的归档".into());
-    }
-    // 全量扫描 + HTML 渲染较重，移入阻塞线程池避免卡住异步运行时。
-    tauri::async_runtime::spawn_blocking(move || {
-    let connection = open_database(&app)?;
-    let items = archive_items_for_export(&connection, &owner_uin, &category, selected.as_ref())?;
-    if items.is_empty() {
-        return Err("当前分类没有可以导出的归档".into());
-    }
-    let category_name = match category.as_str() {
-        "self" => "本人动态",
-        "other" => "其他动态",
-        _ => "留言",
-    };
+/// 导出 HTML 的媒体地址解析器：把动态里的图片/视频改写为实际展示地址。
+/// 轻量导出直接使用远程地址；离线包导出改写为包内相对路径。
+pub(crate) struct ExportMediaResolver<'a> {
+    /// (动态下标, 图片下标, 远程地址) -> 展示地址
+    pub picture: &'a dyn Fn(usize, usize, &str) -> String,
+    /// (动态下标, 远程视频地址) -> 包内视频地址；None 表示保留远程链接
+    pub video: &'a dyn Fn(usize, &str) -> Option<String>,
+}
+
+pub(crate) const EXPORT_CSS: &str = "*{box-sizing:border-box}body{margin:0;background:#f3f6fb;color:#243247;font:14px/1.7 system-ui,-apple-system,\"Microsoft YaHei\",sans-serif}main{width:min(820px,calc(100% - 24px));margin:30px auto}h1{margin:0}.intro{color:#758298;margin:0 0 20px}.card{background:#fff;border:1px solid #e5eaf2;border-radius:16px;padding:20px;margin:14px 0;box-shadow:0 8px 25px #2038580b}header{display:flex;gap:11px;align-items:center}.avatar{width:44px;height:44px;border-radius:50%}header strong,header small{display:block}small,.muted,.stats{color:#7e899a}.content{margin:14px 0;white-space:pre-wrap;overflow-wrap:anywhere}.mention,a{color:#2684ff}.pictures{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.pictures img{display:block;width:100%;height:210px;object-fit:cover;border-radius:8px}.video{display:inline-block;padding:7px 12px;background:#edf5ff;border-radius:9px;text-decoration:none}.stats{margin-top:12px}.comments{margin-top:12px;padding:12px;background:#f6f8fb;border-radius:10px}.comment{margin:8px 0}.comment-meta{margin-bottom:3px;color:#7e899a;font-size:11px}.comment-meta b{color:#2684ff}.replies{margin:6px 0 0 18px;padding:7px 10px;border-left:2px solid #c9dcf6;background:#fff;border-radius:0 7px 7px 0}@media(max-width:600px){main{margin:16px auto}.card{padding:15px}.pictures img{height:125px}}";
+
+pub(crate) fn render_feed_cards(items: &[ArchiveItem], media: &ExportMediaResolver<'_>) -> String {
     let mut cards = String::new();
-    for item in &items {
+    for (item_index, item) in items.iter().enumerate() {
         let author = item
             .author_name
             .as_deref()
@@ -2701,19 +2789,29 @@ pub async fn export_archived_html(
         cards.push_str("</div>");
         if !item.picture_urls.is_empty() {
             cards.push_str("<div class=\"pictures\">");
-            for url in &item.picture_urls {
+            for (picture_index, url) in item.picture_urls.iter().enumerate() {
+                let src = (media.picture)(item_index, picture_index, url);
                 cards.push_str("<a href=\"");
                 cards.push_str(&html_escape(url));
                 cards.push_str("\" target=\"_blank\"><img loading=\"lazy\" referrerpolicy=\"no-referrer\" src=\"");
-                cards.push_str(&html_escape(url));
+                cards.push_str(&html_escape(&src));
                 cards.push_str("\"></a>");
             }
             cards.push_str("</div>");
         }
         if let Some(video) = &item.video_url {
-            cards.push_str("<p><a class=\"video\" href=\"");
-            cards.push_str(&html_escape(video));
-            cards.push_str("\" target=\"_blank\">▶ 查看视频</a></p>");
+            match (media.video)(item_index, video) {
+                Some(local) => {
+                    cards.push_str("<video controls preload=\"metadata\" style=\"width:100%;max-width:480px;border-radius:9px;background:#000\" src=\"");
+                    cards.push_str(&html_escape(&local));
+                    cards.push_str("\"></video>");
+                }
+                None => {
+                    cards.push_str("<p><a class=\"video\" href=\"");
+                    cards.push_str(&html_escape(video));
+                    cards.push_str("\" target=\"_blank\">▶ 查看视频</a></p>");
+                }
+            }
         }
         cards.push_str("<div class=\"stats\">");
         if !item.likes.is_empty() {
@@ -2789,11 +2887,57 @@ pub async fn export_archived_html(
         }
         cards.push_str("</article>");
     }
-    Ok(format!(
-        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>QQ空间归档 - {category_name}</title><style>*{{box-sizing:border-box}}body{{margin:0;background:#f3f6fb;color:#243247;font:14px/1.7 system-ui,-apple-system,"Microsoft YaHei",sans-serif}}main{{width:min(820px,calc(100% - 24px));margin:30px auto}}h1{{margin:0}}.intro{{color:#758298;margin:0 0 20px}}.card{{background:#fff;border:1px solid #e5eaf2;border-radius:16px;padding:20px;margin:14px 0;box-shadow:0 8px 25px #2038580b}}header{{display:flex;gap:11px;align-items:center}}.avatar{{width:44px;height:44px;border-radius:50%}}header strong,header small{{display:block}}small,.muted,.stats{{color:#7e899a}}.content{{margin:14px 0;white-space:pre-wrap;overflow-wrap:anywhere}}.mention,a{{color:#2684ff}}.pictures{{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}}.pictures img{{display:block;width:100%;height:210px;object-fit:cover;border-radius:8px}}.video{{display:inline-block;padding:7px 12px;background:#edf5ff;border-radius:9px;text-decoration:none}}.stats{{margin-top:12px}}.comments{{margin-top:12px;padding:12px;background:#f6f8fb;border-radius:10px}}.comment{{margin:8px 0}}.comment-meta{{margin-bottom:3px;color:#7e899a;font-size:11px}}.comment-meta b{{color:#2684ff}}.replies{{margin:6px 0 0 18px;padding:7px 10px;border-left:2px solid #c9dcf6;background:#fff;border-radius:0 7px 7px 0}}@media(max-width:600px){{main{{margin:16px auto}}.card{{padding:15px}}.pictures img{{height:125px}}}}</style></head><body><main><h1>QQ空间归档 · {category_name}</h1><p class="intro">账号 {owner} · 共 {count} 条 · 导出时间 <span id="export-time"></span></p>{cards}</main><script>document.querySelector('#export-time').textContent=new Date().toLocaleString();document.querySelectorAll('time[data-time]').forEach(e=>e.textContent=new Date(Number(e.dataset.time)*1000).toLocaleString());</script></body></html>"#,
-        owner = html_escape(&owner_uin),
-        count = items.len()
-    ))
+    cards
+}
+
+pub(crate) fn feed_document(
+    items: &[ArchiveItem],
+    category_name: &str,
+    owner_uin: &str,
+    media: &ExportMediaResolver<'_>,
+) -> String {
+    let cards = render_feed_cards(items, media);
+    format!(
+        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>QQ空间归档 - {category_name}</title><style>{css}</style></head><body><main><h1>QQ空间归档 · {category_name}</h1><p class="intro">账号 {owner} · 共 {count} 条 · 导出时间 <span id="export-time"></span></p>{cards}</main><script>document.querySelector('#export-time').textContent=new Date().toLocaleString();document.querySelectorAll('time[data-time]').forEach(e=>e.textContent=new Date(Number(e.dataset.time)*1000).toLocaleString());</script></body></html>"#,
+        css = EXPORT_CSS,
+        category_name = html_escape(category_name),
+        owner = html_escape(owner_uin),
+        count = items.len(),
+        cards = cards,
+    )
+}
+
+#[tauri::command]
+pub async fn export_archived_html(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    category: String,
+    ids: Option<Vec<i64>>,
+) -> Result<String, String> {
+    validate_category(&category)?;
+    let owner_uin = login.qzone_auth().await?.uin;
+    let selected = ids.map(|values| values.into_iter().collect::<HashSet<_>>());
+    if selected.as_ref().is_some_and(HashSet::is_empty) {
+        return Err("请先选择需要导出的归档".into());
+    }
+    // 全量扫描 + HTML 渲染较重，移入阻塞线程池避免卡住异步运行时。
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = open_database(&app)?;
+        let items =
+            archive_items_for_export(&connection, &owner_uin, &category, selected.as_ref())?;
+        if items.is_empty() {
+            return Err("当前分类没有可以导出的归档".into());
+        }
+        let category_name = match category.as_str() {
+            "self" => "本人动态",
+            "other" => "其他动态",
+            _ => "留言",
+        };
+        let resolver = ExportMediaResolver {
+            picture: &|_, _, url| url.to_owned(),
+            video: &|_, _| None,
+        };
+        Ok(feed_document(&items, category_name, &owner_uin, &resolver))
     })
     .await
     .map_err(|error| format!("归档导出任务异常退出：{error}"))?
@@ -2856,11 +3000,29 @@ pub async fn get_archive_overview(
         .map(|json| picture_urls(json).len() as u64)
         .sum();
     let database_bytes = fs::metadata(database).map(|value| value.len()).unwrap_or(0);
+    let albums = connection
+        .query_row(
+            "SELECT COUNT(*) FROM archive_albums WHERE owner_uin=?1",
+            params![owner_uin],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("统计相册失败：{error}"))?
+        .max(0) as u64;
+    let album_photos_backed = connection
+        .query_row(
+            "SELECT COUNT(*) FROM archive_album_photos WHERE owner_uin=?1 AND status='done'",
+            params![owner_uin],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("统计相册照片失败：{error}"))?
+        .max(0) as u64;
     Ok(ArchiveOverview {
         dynamics,
         pictures,
         comments: comments.max(0) as u64,
         likes: likes.max(0) as u64,
+        albums,
+        album_photos_backed,
         database_bytes,
     })
 }
