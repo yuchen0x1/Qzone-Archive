@@ -18,7 +18,7 @@ export interface UpdateInfo {
 export type UpdatePlatform = "windows" | "macos" | "linux" | "android" | "ios";
 
 /** 更新接口不可用（限流/网络拦截）时的兜底下载地址。 */
-const DEFAULT_RELEASES_PAGE_URL = "https://gitee.com/yuchen0x1/Qzone-Archive/releases";
+const DEFAULT_RELEASES_PAGE_URL = "https://github.com/yuchen0x1/Qzone-Archive/releases";
 const configuredReleasesPageUrl = import.meta.env.VITE_RELEASES_URL?.trim();
 export const RELEASES_PAGE_URL = configuredReleasesPageUrl || DEFAULT_RELEASES_PAGE_URL;
 

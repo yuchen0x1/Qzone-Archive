@@ -54,14 +54,14 @@ QQ 空间中的历史动态与互动内容长期依赖第三方平台接口，�
 - **离线包导出**：把动态分类页、已备份相册、本地缓存的图片视频和结构化 `data.json` 打包为一个 ZIP，在断网设备上也能完整浏览。
 - **相册回收站恢复**：验证独立密码后浏览回收站相册与照片，可将单张照片恢复到新建或已有相册，也可整体恢复相册。
 - **数据管理**：不同 QQ 账号的归档数据隔离存储；可删除所选归档、清空归档，或在设置中一键删除全部本地数据（不可撤销）。
-- **在线更新**：启动时自动检查发布仓库的新版本，也可在“关于”页手动检查；更新源可在构建时切换到国内 Gitee/GitCode 仓库，发现新版本后会按当前平台提供对应安装包下载入口。
+- **在线更新**：启动时自动检查发布仓库的新版本，也可在“关于”页手动检查；更新源默认使用 GitHub Releases，也可在构建时切换到国内 Gitee/GitCode 仓库，发现新版本后会按当前平台提供对应安装包下载入口。
 - **跨平台**：支持 Windows、macOS、Linux 桌面端和 Android 移动端；发布同时产出未签名的 iOS IPA（需自行签名后侧载）。
 
 ## 安装
 
 ### 下载发布包
 
-从当前维护仓库的 [Releases](https://gitee.com/yuchen0x1/Qzone-Archive/releases) 页面下载对应平台的安装包：
+从当前维护仓库的 [Releases](https://github.com/yuchen0x1/Qzone-Archive/releases) 页面下载对应平台的安装包：
 
 - Windows：`.exe` 安装程序
 - macOS：`.dmg` 安装包（x64 / ARM64）
@@ -69,7 +69,7 @@ QQ 空间中的历史动态与互动内容长期依赖第三方平台接口，�
 - Android：`.apk` 安装包
 - iOS：未签名 `.ipa`（需使用 AltStore、Sideloadly 等工具自行签名后侧载）
 
-首次启动需要阅读并同意应用内的《免责声明与使用须知》。想尝鲜最新功能，可关注 [Releases](https://gitee.com/yuchen0x1/Qzone-Archive/releases) 页面中的预发布版本（如有，仅建议测试使用）。
+首次启动需要阅读并同意应用内的《免责声明与使用须知》。想尝鲜最新功能，可关注 [Releases](https://github.com/yuchen0x1/Qzone-Archive/releases) 页面中的预发布版本（如有，仅建议测试使用）。
 
 ### 从源码运行
 
@@ -84,7 +84,7 @@ QQ 空间中的历史动态与互动内容长期依赖第三方平台接口，�
 
 ```bash
 # 克隆当前维护仓库
-git clone https://gitee.com/yuchen0x1/Qzone-Archive.git
+git clone https://github.com/yuchen0x1/Qzone-Archive.git
 cd Qzone-Archive
 
 # Linux 桌面端构建依赖（Debian/Ubuntu）
@@ -231,7 +231,7 @@ QQ 视频地址带有时效签名，过期后需要重新归档以更新地址�
 程序会优先读取本地缓存，失败时自动尝试原始地址；列表中可点击“加载失败，重试”。
 
 **检查更新提示失败？**
-更新检查默认访问 Gitee 的发布接口，也可在构建时切换到 GitHub/GitCode 等发布仓库；网络不可达时会提示失败，不影响其他功能。
+更新检查默认访问 GitHub 的发布接口，也可在构建时切换到 Gitee/GitCode 等发布仓库；网络不可达时会提示失败，不影响其他功能。
 
 **如何备份归档数据？**
 应用数据目录中的 `qzone-archive.sqlite3` 和媒体缓存就是完整归档数据，可整体复制；也可以使用“导出全部”生成离线 HTML。重要资料建议定期另行备份。
@@ -252,7 +252,7 @@ QQ 视频地址带有时效签名，过期后需要重新归档以更新地址�
 2. 不要提交 QQ 账号、密码、Cookie、Token、个人隐私数据、签名密钥、数据库和本地构建产物。
 3. 对前端改动运行 `npm run build`；对 Rust 改动（在 `src-tauri/` 下）运行 `cargo fmt --check` 和 `cargo check`。
 
-详细的贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)，面向协作者的仓库约定见 [AGENTS.md](AGENTS.md)。版本记录见 [Releases](https://gitee.com/yuchen0x1/Qzone-Archive/releases)。
+详细的贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)，面向协作者的仓库约定见 [AGENTS.md](AGENTS.md)。版本记录见 [Releases](https://github.com/yuchen0x1/Qzone-Archive/releases)。
 
 ## 许可证
 

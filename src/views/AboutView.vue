@@ -72,7 +72,7 @@ function currentUpdateAsset(info: UpdateInfo) {
     <article class="surface-card settings-card">
       <div class="settings-copy"><span class="settings-icon tone-purple"><i class="pi pi-heart-fill" /></span><div><h3>项目状态</h3><p>正常更新中 · yuchen0x1 · Qzone-Archive</p></div></div>
       <div class="about-links">
-      <Button label="项目主页" icon="pi pi-external-link" severity="secondary" outlined @click="openUrl('https://gitee.com/yuchen0x1/Qzone-Archive')" />
+      <Button label="项目主页" icon="pi pi-github" severity="secondary" outlined @click="openUrl('https://github.com/yuchen0x1/Qzone-Archive')" />
       </div>
     </article>
 

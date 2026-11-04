@@ -2,8 +2,8 @@ use serde::Serialize;
 use tauri::AppHandle;
 use url::Url;
 
-const RELEASE_API: &str = "https://gitee.com/api/v5/repos/yuchen0x1/Qzone-Archive/releases/latest";
-const RELEASES_PAGE_URL: &str = "https://gitee.com/yuchen0x1/Qzone-Archive/releases";
+const RELEASE_API: &str = "https://api.github.com/repos/yuchen0x1/Qzone-Archive/releases/latest";
+const RELEASES_PAGE_URL: &str = "https://github.com/yuchen0x1/Qzone-Archive/releases";
 const ALLOWED_UPDATE_HOSTS: [&str; 6] = [
     "api.github.com",
     "github.com",
@@ -145,7 +145,7 @@ fn parse_update_info(
         latest_version: tag.trim_start_matches('v').to_string(),
         notes: release["body"].as_str().unwrap_or_default().to_string(),
         release_url: safe_release_page_url(release["html_url"].as_str().unwrap_or_default(), &tag),
-        // Gitee 的 latest 接口 published_at 可能为 null，回退到 created_at
+        // 部分发布平台的 latest 接口 published_at 可能为 null，回退到 created_at
         published_at: release["published_at"]
             .as_str()
             .or_else(|| release["created_at"].as_str())
@@ -275,7 +275,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             info.release_url,
-            "https://gitee.com/yuchen0x1/Qzone-Archive/releases/tag/v1.0.7"
+            "https://github.com/yuchen0x1/Qzone-Archive/releases/tag/v1.0.7"
         );
     }
 }
