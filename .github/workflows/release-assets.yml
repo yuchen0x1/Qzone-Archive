@@ -141,7 +141,8 @@ jobs:
         run: npx tauri ios init
       - name: Build unsigned app for device
         run: |
-          PROJ=$(ls src-tauri/gen/apple/*.xcodeproj | head -1)
+          PROJ=$(find src-tauri/gen/apple -maxdepth 1 -name "*.xcodeproj" -type d | head -1)
+          test -n "$PROJ" || { ls src-tauri/gen/apple; exit 1; }
           echo "Using project: $PROJ"
           SCHEME=$(xcodebuild -list -project "$PROJ" | awk '/Schemes:/{getline; print $1; exit}')
           echo "Using scheme: $SCHEME"
