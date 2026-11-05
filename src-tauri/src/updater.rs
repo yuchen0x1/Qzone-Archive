@@ -439,7 +439,8 @@ pub async fn download_update_asset(
             last_emit = std::time::Instant::now();
         }
     }
-    file.flush().map_err(|error| format!("写入更新文件失败：{error}"))?;
+    file.flush()
+        .map_err(|error| format!("写入更新文件失败：{error}"))?;
     drop(file);
     emit(downloaded);
     std::fs::rename(&partial, &target).map_err(|error| format!("保存更新文件失败：{error}"))?;
