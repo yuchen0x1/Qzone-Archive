@@ -59,7 +59,7 @@ jobs:
             libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
             libgtk-3-dev patchelf
       - name: Build Linux bundles
-        run: npx tauri build
+        run: npx tauri build --bundles deb,appimage
       - name: Upload deb artifact
         uses: actions/upload-artifact@v4
         with:
@@ -141,8 +141,12 @@ jobs:
         run: npx tauri ios init
       - name: Build unsigned app for device
         run: |
-          xcodebuild -project src-tauri/gen/apple/QzoneArchive_iOS.xcodeproj \
-            -scheme QzoneArchive_iOS \
+          PROJ=$(ls src-tauri/gen/apple/*.xcodeproj | head -1)
+          echo "Using project: $PROJ"
+          SCHEME=$(xcodebuild -list -project "$PROJ" | awk '/Schemes:/{getline; print $1; exit}')
+          echo "Using scheme: $SCHEME"
+          xcodebuild -project "$PROJ" \
+            -scheme "$SCHEME" \
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -derivedDataPath src-tauri/gen/apple/build \
@@ -151,8 +155,11 @@ jobs:
             build
       - name: Package unsigned ipa
         run: |
-          APP="src-tauri/gen/apple/build/Build/Products/Release-iphoneos/QzoneArchive.app"
-          test -d "$APP" || { ls src-tauri/gen/apple/build/Build/Products/Release-iphoneos/; exit 1; }
+          PRODUCT_DIR="src-tauri/gen/apple/build/Build/Products/Release-iphoneos"
+          APP=$(ls -d "$PRODUCT_DIR"/*.app | head -1)
+          test -d "$APP" || { ls "$PRODUCT_DIR" 2>/dev/null; exit 1; }
+          echo "Packaging: $APP"
+          rm -rf Payload
           mkdir -p Payload
           cp -R "$APP" Payload/
           zip -qry "QzoneArchive_${{ inputs.tag }}_ios-unsigned.ipa" Payload
