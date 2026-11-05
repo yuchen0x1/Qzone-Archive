@@ -36,6 +36,7 @@ encoding_rs = "0.8"
 url = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+filetime = "0.2.29"
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.38.2"

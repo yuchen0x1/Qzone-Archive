@@ -31,6 +31,8 @@ const GUESTBOOK_URL: &str =
     "https://user.qzone.qq.com/proxy/domain/m.qzone.qq.com/cgi-bin/new/guestbook/get_guestbook_list";
 const FRIEND_LIST_URL: &str =
     "https://h5.qzone.qq.com/proxy/domain/r.qzone.qq.com/cgi-bin/tfriend/friend_head_get.fcg";
+const SHUOSHUO_LIST_URL: &str =
+    "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6";
 
 #[derive(Clone, Default)]
 pub struct RecycleAuthState {
@@ -986,6 +988,49 @@ pub async fn fetch_friend_list(state: tauri::State<'_, QLoginState>) -> Result<V
         .map_err(|error| format!("读取好友列表响应失败：{error}"))?;
     if !status.is_success() {
         return Err(format!("获取好友列表失败：HTTP {status}"));
+    }
+    ensure_qzone_success(parse_qzone_json(&text)?)
+}
+
+/// 获取官方说说主页列表（emotion_cgi_msglist_v6）：支持无点赞/无评论的说说全量获取
+#[tauri::command]
+pub async fn fetch_shuoshuo_page(
+    state: tauri::State<'_, QLoginState>,
+    pos: u32,
+    num: u32,
+) -> Result<Value, String> {
+    let auth = state.qzone_auth().await?;
+    let num = num.clamp(1, 40);
+    let query = vec![
+        ("uin", auth.uin.clone()),
+        ("hostUin", auth.uin.clone()),
+        ("pos", pos.to_string()),
+        ("num", num.to_string()),
+        ("g_tk", auth.g_tk.to_string()),
+        ("format", "jsonp".into()),
+        ("inCharset", "utf-8".into()),
+        ("outCharset", "utf-8".into()),
+        ("notice", "0".into()),
+        ("need_private_comment", "1".into()),
+    ];
+    let response = state
+        .client()
+        .get(SHUOSHUO_LIST_URL)
+        .query(&query)
+        .header(ACCEPT, "application/json, text/javascript, */*; q=0.01")
+        .header(REFERER, format!("https://user.qzone.qq.com/{}", auth.uin))
+        .header(USER_AGENT, &auth.user_agent)
+        .header(COOKIE, &auth.cookie_header)
+        .send()
+        .await
+        .map_err(|error| format!("获取说说列表失败：{error}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("读取说说列表响应失败：{error}"))?;
+    if !status.is_success() {
+        return Err(format!("获取说说列表失败：HTTP {status}"));
     }
     ensure_qzone_success(parse_qzone_json(&text)?)
 }

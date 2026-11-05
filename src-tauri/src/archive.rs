@@ -291,7 +291,12 @@ pub(crate) fn open_database(app: &tauri::AppHandle) -> Result<Connection, String
     let mut connection = Connection::open(database_path(app)?)
         .map_err(|error| format!("无法打开归档数据库：{error}"))?;
     connection
-        .execute_batch("PRAGMA journal_mode=WAL;\n         PRAGMA foreign_keys=ON;")
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA busy_timeout=5000;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA foreign_keys=ON;",
+        )
         .map_err(|error| format!("初始化归档数据库失败：{error}"))?;
     let schema_version: i32 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -1276,11 +1281,29 @@ pub(crate) async fn download_qzone_image(
     Err(format!("所有 QQ 图片地址均加载失败：{last_error}"))
 }
 
+pub(crate) fn set_file_timestamp(path: &std::path::Path, timestamp_secs: i64) {
+    if timestamp_secs <= 0 {
+        return;
+    }
+    let ft = filetime::FileTime::from_unix_time(timestamp_secs, 0);
+    let _ = filetime::set_file_times(path, ft, ft);
+}
+
 /// 原子落盘：先写临时文件再改名，避免半张图片占用正式文件名导致续传误判。
+#[allow(dead_code)]
 pub(crate) fn persist_downloaded_image(
     image_dir: &std::path::Path,
     file_stem: &str,
     downloaded: &DownloadedImage,
+) -> Result<PathBuf, String> {
+    persist_downloaded_image_with_time(image_dir, file_stem, downloaded, None)
+}
+
+pub(crate) fn persist_downloaded_image_with_time(
+    image_dir: &std::path::Path,
+    file_stem: &str,
+    downloaded: &DownloadedImage,
+    timestamp_secs: Option<i64>,
 ) -> Result<PathBuf, String> {
     let path = image_dir.join(format!("{file_stem}.{}", downloaded.extension));
     let nonce = SystemTime::now()
@@ -1296,6 +1319,9 @@ pub(crate) fn persist_downloaded_image(
             return Err(format!("保存图片归档失败：{error}"));
         }
         let _ = fs::remove_file(&temporary);
+    }
+    if let Some(ts) = timestamp_secs {
+        set_file_timestamp(&path, ts);
     }
     Ok(path)
 }
@@ -1315,13 +1341,13 @@ pub async fn load_archived_image(
         return Ok(path.to_string_lossy().into_owned());
     }
 
-    let pictures_json = {
+    let (pictures_json, published_at) = {
         let connection = open_database(&app)?;
         connection
             .query_row(
-                "SELECT pictures_json FROM archive_dynamics WHERE id=?1 AND owner_uin=?2",
+                "SELECT pictures_json, published_at FROM archive_dynamics WHERE id=?1 AND owner_uin=?2",
                 params![id, auth.uin],
-                |row| row.get::<_, Option<String>>(0),
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
             )
             .map_err(|error| match error {
                 rusqlite::Error::QueryReturnedNoRows => "当前账号中不存在这条图片归档".into(),
@@ -1347,7 +1373,12 @@ pub async fn load_archived_image(
         .build()
         .map_err(|error| format!("创建图片请求客户端失败：{error}"))?;
     let downloaded = download_qzone_image(&auth, &candidates, &client).await?;
-    let path = persist_downloaded_image(&image_dir, &file_stem, &downloaded)?;
+    let path = persist_downloaded_image_with_time(
+        &image_dir,
+        &file_stem,
+        &downloaded,
+        Some(published_at),
+    )?;
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -2334,6 +2365,60 @@ pub async fn list_archived_feeds(
     .map_err(|error| format!("归档查询任务异常退出：{error}"))?
 }
 
+/// 那年今日：查询历史上今天（相同月日，但不同年份）的动态记录
+#[tauri::command]
+pub async fn list_on_this_day_feeds(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+) -> Result<Vec<ArchiveItem>, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    tauri::async_runtime::spawn_blocking(move || {
+        let connection = open_database(&app)?;
+        // 使用 sqlite 的 strftime('%m-%d', datetime(published_at, 'unixepoch', 'localtime')) 进行对比
+        let mut statement = connection
+            .prepare(
+                "SELECT d.id,d.owner_uin,d.cell_id,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
+                  (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type=217),
+                  (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type IN (2,311))
+                 FROM archive_dynamics d
+                 WHERE d.owner_uin=?1 AND d.published_at > 0
+                   AND strftime('%m-%d', datetime(d.published_at, 'unixepoch', 'localtime')) = strftime('%m-%d', 'now', 'localtime')
+                   AND strftime('%Y', datetime(d.published_at, 'unixepoch', 'localtime')) != strftime('%Y', 'now', 'localtime')
+                 ORDER BY d.published_at DESC LIMIT 50",
+            )
+            .map_err(|error| format!("准备那年今日查询失败：{error}"))?;
+        let rows = statement
+            .query_map(params![owner_uin], |row| {
+                let video_json = row.get::<_, Option<String>>(8)?;
+                let video_urls = video_urls(video_json.clone());
+                Ok(ArchiveItem {
+                    id: row.get(0)?,
+                    owner_uin: row.get(1)?,
+                    cell_id: row.get(2)?,
+                    published_at: row.get(3)?,
+                    content: row.get(4)?,
+                    author_uin: row.get(5)?,
+                    author_name: row.get(6)?,
+                    picture_urls: picture_urls(row.get(7)?),
+                    video_url: video_urls.first().cloned(),
+                    video_urls,
+                    video_cover_url: video_cover_url(video_json),
+                    like_count: row.get(9)?,
+                    comment_count: row.get(10)?,
+                    likes: vec![],
+                    comments: vec![],
+                })
+            })
+            .map_err(|error| format!("查询那年今日失败：{error}"))?;
+        let items = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("读取那年今日记录失败：{error}"))?;
+        Ok(items)
+    })
+    .await
+    .map_err(|error| format!("那年今日任务异常退出：{error}"))?
+}
+
 #[tauri::command]
 pub async fn list_archived_media(
     app: tauri::AppHandle,
@@ -3315,7 +3400,7 @@ struct GuestbookReply {
     time: i64,
 }
 
-struct GuestbookEntry {
+pub(crate) struct GuestbookEntry {
     key: String,
     author_uin: Option<String>,
     author_name: Option<String>,
@@ -3517,6 +3602,145 @@ pub async fn save_guestbook_page(
     })
 }
 
+// ---------- 官方说说列表同步 ----------
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShuoshuoSyncPage {
+    pub fetched: u64,
+    pub saved: u64,
+    pub total: u64,
+}
+
+/// 解析 emotion_cgi_msglist_v6 响应中的 msglist
+pub(crate) fn parse_shuoshuo_page(value: &Value) -> (u64, Vec<Value>) {
+    let total = value
+        .get("total")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            value
+                .get("data")
+                .and_then(|d| d.get("total"))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(0);
+    let list = value
+        .get("msglist")
+        .or_else(|| value.get("data").and_then(|d| d.get("msglist")))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    (total, list)
+}
+
+fn save_shuoshuo_entries(
+    connection: &Connection,
+    owner_uin: &str,
+    entries: &[Value],
+    timestamp: i64,
+) -> Result<u64, String> {
+    let mut saved = 0u64;
+    for item in entries {
+        let tid = item.get("tid").and_then(Value::as_str).unwrap_or("");
+        if tid.is_empty() {
+            continue;
+        }
+        let cell_id = tid.to_owned();
+        let content = item
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let created_time = item
+            .get("created_time")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let uin = item
+            .get("uin")
+            .and_then(|u| {
+                if let Some(s) = u.as_str() {
+                    Some(s.to_string())
+                } else {
+                    u.as_i64().map(|n| n.to_string())
+                }
+            })
+            .unwrap_or_else(|| owner_uin.to_string());
+        let name = item.get("name").and_then(Value::as_str);
+
+        // 处理 pic 列表
+        let pic_array = item.get("pic").and_then(Value::as_array);
+        let pictures_json = pic_array.map(|pics| {
+            let photo_list: Vec<Value> = pics
+                .iter()
+                .filter_map(|p| {
+                    let url = p
+                        .get("url1")
+                        .or_else(|| p.get("url2"))
+                        .or_else(|| p.get("url3"))?;
+                    Some(json!({
+                        "photourl": [{
+                            "url": url
+                        }]
+                    }))
+                })
+                .collect();
+            json!({
+                "picdata": {
+                    "pic": photo_list
+                }
+            })
+            .to_string()
+        });
+
+        let changed = connection
+            .execute(
+                "INSERT INTO archive_dynamics
+                   (owner_uin,cell_id,published_at,content,author_uin,author_name,category,pictures_json,raw_original_json,archived_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,'self',?7,?8,?9)
+                 ON CONFLICT(owner_uin,cell_id) DO UPDATE SET
+                   content=excluded.content,
+                   published_at=CASE WHEN archive_dynamics.published_at <= 0 THEN excluded.published_at ELSE archive_dynamics.published_at END,
+                   pictures_json=COALESCE(archive_dynamics.pictures_json, excluded.pictures_json),
+                   raw_original_json=COALESCE(archive_dynamics.raw_original_json, excluded.raw_original_json)",
+                params![
+                    owner_uin,
+                    cell_id,
+                    created_time,
+                    content,
+                    uin,
+                    name,
+                    pictures_json,
+                    item.to_string(),
+                    timestamp,
+                ],
+            )
+            .map_err(|error| format!("保存说说失败：{error}"))?;
+        saved += changed as u64;
+    }
+    Ok(saved)
+}
+
+/// 抓取一页官方说说并入库
+#[tauri::command]
+pub async fn save_shuoshuo_page(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    pos: u32,
+    num: u32,
+) -> Result<ShuoshuoSyncPage, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    let page = qzone::fetch_shuoshuo_page(login.clone(), pos, num).await?;
+    let (total, entries) = parse_shuoshuo_page(&page);
+    let fetched = entries.len() as u64;
+    let connection = open_database(&app)?;
+    let saved = save_shuoshuo_entries(&connection, &owner_uin, &entries, now())?;
+    Ok(ShuoshuoSyncPage {
+        fetched,
+        saved,
+        total,
+    })
+}
+
 // ---------- 好友列表 ----------
 
 #[derive(Clone, Serialize)]
@@ -3612,7 +3836,7 @@ pub async fn list_friend_contacts(
 /// 把 unix 秒格式化为本地时区的 "YYYY-MM-DD HH:mm"。
 /// 本地时区偏移经 chrono 获取并缓存（HTML 导出走浏览器 toLocaleString，这里需要服务端等价实现）。
 pub(crate) fn format_unix_time(seconds: i64) -> String {
-    use chrono::{Local, TimeZone};
+    use chrono::Local;
     static OFFSET: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     let offset = *OFFSET.get_or_init(|| Local::now().offset().local_minus_utc() as i64);
     // Howard Hinnant 的 civil_from_days 算法，避免依赖 chrono 的完整格式化栈。

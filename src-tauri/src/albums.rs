@@ -15,7 +15,8 @@ use serde_json::{json, Value};
 use crate::{
     archive::{
         archived_image_dir, download_qzone_image, existing_archived_image, open_database,
-        persist_downloaded_image, reserve_archive_page, stable_feed_hash, ArchiveState,
+        persist_downloaded_image_with_time, reserve_archive_page, set_file_timestamp,
+        stable_feed_hash, ArchiveState,
     },
     qlogin::QLoginState,
     qzone,
@@ -483,6 +484,7 @@ pub(crate) struct AlbumPhotoTask {
     photo_id: i64,
     album_id: String,
     pic_key: String,
+    upload_time: Option<i64>,
     urls: Vec<String>,
 }
 
@@ -493,7 +495,7 @@ fn load_album_photo_task(
 ) -> Result<AlbumPhotoTask, String> {
     connection
         .query_row(
-            "SELECT album_id,pic_key,urls_json FROM archive_album_photos
+            "SELECT album_id,pic_key,urls_json,upload_time FROM archive_album_photos
              WHERE id=?1 AND owner_uin=?2",
             params![photo_id, owner_uin],
             |row| {
@@ -503,6 +505,7 @@ fn load_album_photo_task(
                     album_id: row.get(0)?,
                     pic_key: row.get(1)?,
                     urls: serde_json::from_str(&urls_json).unwrap_or_default(),
+                    upload_time: row.get(3)?,
                 })
             },
         )
@@ -527,6 +530,9 @@ async fn process_album_photo(
     let file_stem = safe_file_stem(&task.pic_key);
     if let Some(path) = existing_archived_image(&image_dir, &file_stem) {
         let size = path.metadata().map(|meta| meta.len()).unwrap_or(0);
+        if let Some(ts) = task.upload_time {
+            set_file_timestamp(&path, ts);
+        }
         return Ok((path, size));
     }
     if task.urls.is_empty() {
@@ -539,7 +545,8 @@ async fn process_album_photo(
         .build()
         .map_err(|error| format!("创建图片请求客户端失败：{error}"))?;
     let downloaded = download_qzone_image(&auth, &task.urls, &client).await?;
-    let path = persist_downloaded_image(&image_dir, &file_stem, &downloaded)?;
+    let path =
+        persist_downloaded_image_with_time(&image_dir, &file_stem, &downloaded, task.upload_time)?;
     let size = downloaded.bytes.len() as u64;
     Ok((path, size))
 }
@@ -721,9 +728,9 @@ pub async fn start_album_backup(
                 let connection = open_database(&app)?;
                 let mut statement = connection
                     .prepare(
-                        "SELECT id,pic_key,urls_json FROM archive_album_photos
-                         WHERE owner_uin=?1 AND album_id=?2 AND status='pending'
-                         ORDER BY id ASC",
+                        "SELECT id,pic_key,urls_json,upload_time FROM archive_album_photos
+                             WHERE owner_uin=?1 AND album_id=?2 AND status='pending'
+                             ORDER BY id ASC",
                     )
                     .map_err(|error| format!("读取待备份照片失败：{error}"))?;
                 let rows = statement
@@ -734,6 +741,7 @@ pub async fn start_album_backup(
                             album_id: album_id.clone(),
                             pic_key: row.get(1)?,
                             urls: serde_json::from_str(&urls_json).unwrap_or_default(),
+                            upload_time: row.get(3)?,
                         })
                     })
                     .map_err(|error| format!("读取待备份照片失败：{error}"))?;
