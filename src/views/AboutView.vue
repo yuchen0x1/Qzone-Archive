@@ -46,6 +46,52 @@ async function checkUpdate() {
 function currentUpdateAsset(info: UpdateInfo) {
   return assetForPlatform(info.assets, platform() as "windows" | "macos" | "linux" | "android" | "ios", arch());
 }
+
+interface ChangelogEntry {
+  version: string;
+  date: string;
+  highlights: string[];
+}
+
+const CHANGELOG: ChangelogEntry[] = [
+  {
+    version: "1.3.0",
+    date: "2026-11-06",
+    highlights: [
+      "全新科技感界面：玻璃拟态卡片、全息光效与呼吸灯动效",
+      "官方说说主页全量同步，无点赞/评论的说说也能归档",
+      "首页新增「那年今日」时光记忆卡片",
+      "新增一键隐私保护模式，全局脱敏模糊",
+      "归档照片写入真实拍摄时间，SQLite 启用 WAL 提速",
+      "新增 macOS / Linux / Android / iOS 官方构建产物",
+    ],
+  },
+  {
+    version: "1.2.0",
+    date: "2026-11-04",
+    highlights: [
+      "留言板全量同步",
+      "好友列表同步与联系人页",
+      "JSON / Markdown 导出（含评论、回复与点赞名单）",
+      "GitHub 首个正式 Release",
+    ],
+  },
+  {
+    version: "1.1.0",
+    date: "2026-09-06",
+    highlights: ["相册备份与断点续传", "离线导出包（HTML + 媒体 + data.json）"],
+  },
+  {
+    version: "1.0.0",
+    date: "2026-09-05",
+    highlights: ["首个公开版本：扫码登录、动态归档、本地浏览"],
+  },
+];
+
+function isCurrentVersion(version: string) {
+  const current = appVersion.value.replace(/^v/i, "");
+  return Boolean(current) && current === version;
+}
 </script>
 
 <template>
@@ -118,6 +164,28 @@ function currentUpdateAsset(info: UpdateInfo) {
           </div>
         </div>
       </div>
+    </article>
+
+    <article class="surface-card changelog-card">
+      <div class="changelog-head">
+        <div class="settings-copy"><span class="settings-icon tone-teal"><i class="pi pi-history" /></span><div><h3>更新日志</h3><p>各版本的主要变化，完整说明见发布页。</p></div></div>
+        <Button label="完整更新日志" icon="pi pi-external-link" severity="secondary" text @click="openUrl(RELEASES_PAGE_URL)" />
+      </div>
+      <ol class="changelog-timeline">
+        <li v-for="entry in CHANGELOG" :key="entry.version" :class="{ 'is-current': isCurrentVersion(entry.version) }">
+          <span class="changelog-dot" />
+          <div class="changelog-entry">
+            <div class="changelog-entry-head">
+              <span class="changelog-version">v{{ entry.version }}</span>
+              <span v-if="isCurrentVersion(entry.version)" class="changelog-current-badge">当前版本</span>
+              <time>{{ entry.date }}</time>
+            </div>
+            <ul class="changelog-highlights">
+              <li v-for="item in entry.highlights" :key="item">{{ item }}</li>
+            </ul>
+          </div>
+        </li>
+      </ol>
     </article>
   </section>
 </template>

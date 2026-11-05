@@ -90,6 +90,24 @@
 /* Settings about and sponsorship */
 .about-card { display: grid; align-items: stretch; gap: 22px; }
 .about-main { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+
+/* 更新日志时间线 */
+.changelog-card { display: grid; gap: 4px; padding: 24px; }
+.changelog-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.changelog-timeline { position: relative; display: grid; gap: 22px; margin: 20px 0 0; padding: 0 0 0 28px; list-style: none; }
+.changelog-timeline::before { content: ""; position: absolute; top: 10px; bottom: 10px; left: 6px; width: 2px; background: linear-gradient(180deg, var(--border-glow), var(--border)); border-radius: 2px; }
+.changelog-timeline li { position: relative; }
+.changelog-dot { position: absolute; top: 6px; left: -27px; width: 10px; height: 10px; background: var(--surface-solid); border: 2px solid var(--primary); border-radius: 50%; box-shadow: 0 0 8px var(--primary-glow); }
+.changelog-timeline li.is-current .changelog-dot { background: var(--primary); box-shadow: 0 0 12px var(--primary-glow), 0 0 0 4px color-mix(in srgb, var(--primary) 14%, transparent); }
+.changelog-entry-head { display: flex; align-items: center; gap: 10px; }
+.changelog-version { padding: 2px 11px; color: var(--primary); background: color-mix(in srgb, var(--primary) 10%, transparent); border: 1px solid color-mix(in srgb, var(--primary) 26%, transparent); border-radius: 999px; font-size: 12px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.changelog-timeline li.is-current .changelog-version { color: #fff; background: linear-gradient(105deg, var(--primary), #06b6d4); border-color: transparent; box-shadow: 0 4px 12px var(--primary-glow); }
+.changelog-current-badge { padding: 2px 9px; color: #0d9488; background: color-mix(in srgb, #14b8a6 14%, transparent); border-radius: 999px; font-size: 10px; font-weight: 700; }
+.app-dark .changelog-current-badge { color: #2dd4bf; }
+.changelog-entry-head time { margin-left: auto; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.changelog-highlights { display: grid; gap: 5px; margin: 9px 0 0; padding: 0; list-style: none; }
+.changelog-highlights li { position: relative; padding-left: 15px; color: var(--muted); font-size: 12.5px; line-height: 1.55; }
+.changelog-highlights li::before { content: "›"; position: absolute; left: 0; color: var(--primary); font-weight: 700; }
 .about-main .version-badge { flex: 0 0 auto; }
 .author-line { margin-top: 7px !important; }
 .author-link { padding: 0; border: 0; color: var(--primary); background: transparent; font: inherit; cursor: pointer; }
