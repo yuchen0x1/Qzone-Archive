@@ -107,13 +107,35 @@ jobs:
           export NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
           echo "Using NDK: $NDK_HOME"
           npx tauri android build --apk
-      - name: Rename APK
+      - name: Sign and rename APK
+        env:
+          TAURI_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          TAURI_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          TAURI_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           VERSION="${{ inputs.tag }}"
           VERSION="${VERSION#v}"
-          APK="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk"
-          test -f "$APK" || { find src-tauri/gen/android/app/build/outputs/apk -name "*.apk"; exit 1; }
-          cp "$APK" "QzoneArchive_${VERSION}_android-universal.apk"
+          APK_DIR="src-tauri/gen/android/app/build/outputs/apk/universal/release"
+          SIGNED="$APK_DIR/app-universal-release.apk"
+          UNSIGNED="$APK_DIR/app-universal-release-unsigned.apk"
+          BUILD_TOOLS=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
+          BT_DIR="$ANDROID_HOME/build-tools/$BUILD_TOOLS"
+          if [ -f "$SIGNED" ]; then
+            cp "$SIGNED" out.apk
+          elif [ -f "$UNSIGNED" ]; then
+            echo "Gradle produced an unsigned APK; signing with apksigner fallback"
+            "$BT_DIR/zipalign" -f 4 "$UNSIGNED" aligned.apk
+            "$BT_DIR/apksigner" sign \
+              --ks "$RUNNER_TEMP/qzone-release.keystore" \
+              --ks-pass "pass:$TAURI_STORE_PASSWORD" \
+              --ks-key-alias "$TAURI_KEY_ALIAS" \
+              --key-pass "pass:$TAURI_KEY_PASSWORD" \
+              --out out.apk aligned.apk
+            "$BT_DIR/apksigner" verify out.apk
+          else
+            find "$APK_DIR" -name "*.apk"; exit 1
+          fi
+          cp out.apk "QzoneArchive_${VERSION}_android-universal.apk"
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
