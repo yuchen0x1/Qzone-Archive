@@ -55,6 +55,11 @@ interface ChangelogEntry {
 
 const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "1.3.1",
+    date: "2026-11-06",
+    highlights: ["关于页新增更新日志时间线"],
+  },
+  {
     version: "1.3.0",
     date: "2026-11-06",
     highlights: [
