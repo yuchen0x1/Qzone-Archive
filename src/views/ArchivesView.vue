@@ -323,6 +323,19 @@ async function loadVideo(item: ArchiveItem) {
   } catch (reason) { videoErrors[item.id] = `视频加载失败：${String(reason)}`; }
   finally { videoLoading[item.id] = false; }
 }
+
+let hoverPreviewTimer: ReturnType<typeof setTimeout> | undefined;
+function handleVideoHover(item: ArchiveItem) {
+  if (!isDesktopPlatform || !item.videoUrl || videoSources[item.id] || videoLoading[item.id]) return;
+  clearTimeout(hoverPreviewTimer);
+  hoverPreviewTimer = setTimeout(() => {
+    void loadVideo(item);
+  }, 350);
+}
+
+function handleVideoLeave() {
+  clearTimeout(hoverPreviewTimer);
+}
 function toggleVisible() {
   const visible = new Set(visibleIds.value);
   selectedIds.value = allVisibleSelected.value ? selectedIds.value.filter((id) => !visible.has(id)) : [...new Set([...selectedIds.value, ...visible])];
@@ -391,7 +404,7 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
         <p class="archive-dynamic-content"><QzoneText :value="item.content" /></p>
         <div v-if="item.pictureUrls.length" class="archive-picture-grid" :class="`pictures-${Math.min(item.pictureUrls.length, 4)}`"><template v-for="(url, pictureIndex) in item.pictureUrls.slice(0, 4)" :key="url"><button v-if="imageSources[url]" type="button" class="archive-picture-button" :aria-label="`查看动态图片 ${pictureIndex + 1}`" @click="openImagePreview(imageSources[url], url, item.cellId, pictureIndex)"><img :src="imageSources[url]" :alt="`动态图片 ${pictureIndex + 1}`" @error="handleArchiveImageError(url)" /></button><div v-else class="archive-image-loading" :data-archive-image="url" :data-dynamic-id="item.id" :data-picture-index="pictureIndex"><i class="pi pi-image" /><button v-if="imageErrors[url]" type="button" class="archive-image-retry" :title="imageErrors[url]" @click.stop="loadArchiveImage(url, item.id, pictureIndex)">加载失败，重试</button><span v-else>{{ imageLoading[url] ? "正在尝试多个图片地址" : "等待加载" }}</span></div></template><span v-if="item.pictureUrls.length > 4" class="picture-more">+{{ item.pictureUrls.length - 4 }}</span></div>
         <video v-if="videoSources[item.id]" :id="`archive-video-${item.id}`" class="archive-video" :src="videoSources[item.id]" controls preload="metadata" playsinline />
-        <div v-else-if="item.videoUrl" class="archive-video-cover" :class="{ 'is-loading': videoLoading[item.id] }" :data-archive-image="item.videoCoverUrl || undefined" role="button" tabindex="0" @click="loadVideo(item)" @keydown.enter="loadVideo(item)">
+        <div v-else-if="item.videoUrl" class="archive-video-cover" :class="{ 'is-loading': videoLoading[item.id] }" :data-archive-image="item.videoCoverUrl || undefined" role="button" tabindex="0" @mouseenter="handleVideoHover(item)" @mouseleave="handleVideoLeave" @click="loadVideo(item)" @keydown.enter="loadVideo(item)">
           <img v-if="item.videoCoverUrl && imageSources[item.videoCoverUrl]" :src="imageSources[item.videoCoverUrl]" @error="handleArchiveImageError(item.videoCoverUrl)" />
           <div class="video-cover-shade"><span class="video-play-button"><i :class="videoLoading[item.id] ? 'pi pi-spin pi-spinner' : 'pi pi-play'" /></span><strong>{{ videoLoading[item.id] ? "正在加载视频…" : "点击播放" }}</strong><small>{{ videoErrors[item.id] || "视频将在点击后下载" }}</small></div>
         </div>

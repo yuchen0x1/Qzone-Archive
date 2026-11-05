@@ -9,7 +9,7 @@ import Tag from "primevue/tag";
 import QzoneText from "../components/QzoneText.vue";
 import StatCard from "../components/StatCard.vue";
 import { useAuthStore } from "../stores/auth";
-import { getArchiveOverview, getArchiveProgress, getInteractionRanking, listArchivedFeeds, type ArchiveItem, type ArchiveOverview, type ArchiveProgress, type InteractionRank } from "../utils/qzone";
+import { getArchiveOverview, getArchiveProgress, getInteractionRanking, listArchivedFeeds, listOnThisDayFeeds, type ArchiveItem, type ArchiveOverview, type ArchiveProgress, type InteractionRank } from "../utils/qzone";
 
 const router = useRouter();
 const authStore = useAuthStore();
@@ -17,6 +17,7 @@ const { loggedIn, user } = storeToRefs(authStore);
 const overview = ref<ArchiveOverview>({ dynamics: 0, pictures: 0, comments: 0, likes: 0, albums: 0, albumPhotosBacked: 0, databaseBytes: 0 });
 const progress = ref<ArchiveProgress>({ status: "idle", pages: 0, fetched: 0, saved: 0, skipped: 0, message: "尚未开始归档" });
 const recent = ref<ArchiveItem[]>([]);
+const onThisDayItems = ref<ArchiveItem[]>([]);
 const ranking = ref<InteractionRank[]>([]);
 const loading = ref(false);
 const loadError = ref("");
@@ -49,12 +50,18 @@ async function loadAvatar(uin: string) {
 async function loadDashboard() {
   releaseAvatars();
   loadError.value = "";
-  if (!loggedIn.value) { overview.value = { dynamics: 0, pictures: 0, comments: 0, likes: 0, albums: 0, albumPhotosBacked: 0, databaseBytes: 0 }; recent.value = []; ranking.value = []; return; }
+  if (!loggedIn.value) { overview.value = { dynamics: 0, pictures: 0, comments: 0, likes: 0, albums: 0, albumPhotosBacked: 0, databaseBytes: 0 }; recent.value = []; onThisDayItems.value = []; ranking.value = []; return; }
   loading.value = true;
   try {
-    const [stats, items, task, ranks] = await Promise.all([getArchiveOverview(), listArchivedFeeds(3, 0), getArchiveProgress(), getInteractionRanking(8)]);
-    overview.value = stats; recent.value = items; progress.value = task; ranking.value = ranks;
-    const avatarUins = [...items.flatMap((item) => item.authorUin ? [item.authorUin] : []), ...ranks.map((item) => item.uin)];
+    const [stats, items, task, ranks, onThisDay] = await Promise.all([
+      getArchiveOverview(),
+      listArchivedFeeds(3, 0),
+      getArchiveProgress(),
+      getInteractionRanking(8),
+      listOnThisDayFeeds().catch(() => []),
+    ]);
+    overview.value = stats; recent.value = items; progress.value = task; ranking.value = ranks; onThisDayItems.value = onThisDay;
+    const avatarUins = [...items.flatMap((item) => item.authorUin ? [item.authorUin] : []), ...onThisDay.flatMap((item) => item.authorUin ? [item.authorUin] : []), ...ranks.map((item) => item.uin)];
     await Promise.all([...new Set(avatarUins)].map(loadAvatar));
   } catch (reason) {
     loadError.value = reason instanceof Error ? reason.message : String(reason);
@@ -82,6 +89,41 @@ onBeforeUnmount(releaseAvatars);
     <StatCard label="相册照片" :value="String(overview.albumPhotosBacked)" :hint="overview.albums ? `已备份 ${overview.albums} 个相册` : '可在相册页备份'" icon="pi pi-camera" tone="teal" />
     <StatCard label="本地占用" :value="storageText" hint="SQLite 资料库" icon="pi pi-database" tone="orange" />
   </section>
+
+  <!-- 那年今日记忆卡片 -->
+  <section v-if="loggedIn && onThisDayItems.length" class="on-this-day-card surface-card" style="margin-top: 20px; position: relative; overflow: hidden; border-color: rgba(233, 89, 119, 0.4); box-shadow: 0 0 25px rgba(233, 89, 119, 0.15);">
+    <div class="section-heading">
+      <div>
+        <span class="section-kicker" style="color: #f43f5e; letter-spacing: 0.18em;">TIME CAPSULE · ON THIS DAY</span>
+        <h3 style="display: flex; align-items: center; gap: 8px;">
+          <i class="pi pi-history" style="color: #f43f5e;" />那年今日的时空记忆
+        </h3>
+      </div>
+      <Tag :value="`${onThisDayItems.length} 条历史时光胶囊`" severity="danger" />
+    </div>
+    <div class="on-this-day-list" style="display: grid; gap: 12px; margin-top: 16px;">
+      <div v-for="item in onThisDayItems" :key="item.id" class="on-this-day-item" style="position: relative; display: flex; gap: 16px; padding: 16px; border-radius: 14px; background: color-mix(in srgb, #f43f5e 5%, var(--surface-solid)); border: 1px solid color-mix(in srgb, #f43f5e 25%, var(--border)); transition: transform 0.2s, box-shadow 0.2s;">
+        <span class="dashboard-recent-avatar" style="border: 1.5px solid #f43f5e; box-shadow: 0 0 10px rgba(244, 63, 94, 0.3);">
+          <img v-if="item.authorUin && avatarSources[item.authorUin]" :src="avatarSources[item.authorUin]" />
+          <i v-else class="pi pi-user" />
+        </span>
+        <div style="flex: 1; min-width: 0;">
+          <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+            <strong style="font-size: 14px; font-weight: 700;">{{ item.authorName || item.authorUin || "我" }}</strong>
+            <small style="color: #f43f5e; font-weight: 700; background: color-mix(in srgb, #f43f5e 12%, transparent); padding: 2px 8px; border-radius: 99px;">{{ formatTime(item.publishedAt) }}</small>
+          </div>
+          <p style="margin: 8px 0 6px; color: var(--heading); font-size: 13.5px; line-height: 1.65;">
+            <QzoneText :value="item.content" />
+          </p>
+          <small style="color: var(--muted); font-size: 11px;">
+            <i class="pi pi-heart" style="color: #f43f5e; margin-right: 4px;" />{{ item.likeCount }} 赞 · 
+            <i class="pi pi-comment" style="color: var(--primary); margin-right: 4px; margin-left: 8px;" />{{ item.commentCount }} 评论
+          </small>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <section class="dashboard-grid">
     <article class="surface-card recent-card">
       <div class="section-heading"><div><span class="section-kicker">最近动态</span><h3>归档记录</h3></div><Button label="查看全部" severity="secondary" text size="small" :disabled="!loggedIn" @click="router.push('/archives')" /></div>

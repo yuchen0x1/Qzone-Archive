@@ -5,7 +5,7 @@ import Button from "primevue/button";
 import ProgressBar from "primevue/progressbar";
 import Tag from "primevue/tag";
 import {
-  cancelFeedArchive, clearResolvedArchiveSkips, getArchiveProgress, listArchiveSkips, retryAllArchiveSkips, retryArchiveSkip, startFeedArchive,
+  cancelFeedArchive, clearResolvedArchiveSkips, getArchiveProgress, listArchiveSkips, retryAllArchiveSkips, retryArchiveSkip, startFeedArchive, syncShuoshuoPage,
   type ArchiveProgress, type ArchiveSkipItem,
 } from "../utils/qzone";
 import { useAuthStore } from "../stores/auth";
@@ -129,6 +129,44 @@ function offsetLabel(item: ArchiveSkipItem) {
   const end = item.cursorOffset + item.offsetAdvance - 1;
   return end > item.cursorOffset ? `${item.cursorOffset}–${end}` : String(item.cursorOffset);
 }
+const shuoshuoSyncing = ref(false);
+const shuoshuoMessage = ref("");
+let shuoshuoCancelRequested = false;
+
+async function syncAllShuoshuo() {
+  if (shuoshuoSyncing.value) {
+    shuoshuoCancelRequested = true;
+    return;
+  }
+  if (!loggedIn.value) return;
+  shuoshuoSyncing.value = true;
+  shuoshuoCancelRequested = false;
+  shuoshuoMessage.value = "正在从官方说说主页全量获取说说…";
+  try {
+    let pos = 0;
+    let totalSaved = 0;
+    for (;;) {
+      if (shuoshuoCancelRequested) break;
+      const page = await syncShuoshuoPage(pos, 20);
+      pos += 20;
+      totalSaved += page.saved;
+      shuoshuoMessage.value = page.total > 0
+        ? `已抓取 ${Math.min(pos, page.total)} / ${page.total} 条说说（已入库 ${totalSaved} 条）`
+        : `已抓取 ${pos} 条说说`;
+      if (page.fetched === 0 || (page.total > 0 && pos >= page.total)) break;
+      await new Promise((resolve) => setTimeout(resolve, getArchiveInterval()));
+    }
+    shuoshuoMessage.value = shuoshuoCancelRequested
+      ? "说说同步已中断，可再次点击继续"
+      : `说说全量抓取完成，共入库 ${totalSaved} 条记录`;
+  } catch (error) {
+    shuoshuoMessage.value = `说说获取失败：${String(error)}`;
+  } finally {
+    shuoshuoSyncing.value = false;
+    await refresh();
+  }
+}
+
 onMounted(async () => { await refresh(); currentTime.value = Date.now(); if (running.value || rateLimited.value || batchRetrying.value || batchProgress.value) beginPolling(); });
 onBeforeUnmount(() => window.clearInterval(timer));
 </script>
@@ -143,10 +181,12 @@ onBeforeUnmount(() => window.clearInterval(timer));
     <div class="task-stats"><div><span>已读取页数</span><strong>{{ progress.pages }}</strong></div><div><span>接口记录</span><strong>{{ progress.fetched }}</strong></div><div><span>写入记录</span><strong>{{ progress.saved }}</strong></div><div><span>待重试异常</span><strong>{{ progress.skipped }}</strong></div></div>
     <div v-if="!loggedIn" class="task-login-notice"><span><i class="pi pi-lock" /></span><div><strong>请先登录 QQ 空间</strong><p>登录后才能创建或继续归档任务。</p></div><Button label="立即登录" icon="pi pi-sign-in" size="small" @click="authStore.openLogin" /></div>
     <div class="task-actions">
-      <Button :label="running ? '归档中…' : batchRetrying ? '批量重试中…' : rateWaiting ? `请等待 ${remainingText}` : rateLimited ? '继续归档' : '开始归档'" icon="pi pi-download" :disabled="running || batchRetrying || rateWaiting || !loggedIn" @click="start" />
+      <Button :label="running ? '归档中…' : batchRetrying ? '批量重试中…' : rateWaiting ? `请等待 ${remainingText}` : rateLimited ? '继续归档' : '开始归档（动态与互动）'" icon="pi pi-download" :disabled="running || batchRetrying || rateWaiting || !loggedIn" @click="start" />
+      <Button :label="shuoshuoSyncing ? (shuoshuoCancelRequested ? '正在停止…' : '停止说说抓取') : '全量同步说说（官方主页）'" icon="pi pi-comments" severity="info" outlined :loading="shuoshuoSyncing && !shuoshuoCancelRequested" :disabled="running || batchRetrying || !loggedIn" @click="syncAllShuoshuo" />
       <Button v-if="running" label="取消" icon="pi pi-times" severity="secondary" outlined @click="cancel" />
       <Button v-if="batchRetrying" :label="batchStopping ? '正在停止…' : '停止重试'" icon="pi pi-stop" severity="warn" outlined :loading="batchStopping" :disabled="batchStopping" @click="stopBatchRetry" />
     </div>
+    <p v-if="shuoshuoMessage" class="task-skip-notice" style="margin-top: 14px;"><i :class="shuoshuoSyncing ? 'pi pi-spin pi-spinner' : 'pi pi-check-circle'" />{{ shuoshuoMessage }}</p>
   </section>
 
   <section v-if="skips.length" class="surface-card task-skips">

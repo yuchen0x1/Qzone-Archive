@@ -21,7 +21,7 @@ const route = useRoute();
 const accountPopover = ref<InstanceType<typeof Popover>>();
 const moreVisible = ref(false);
 const logoutLoading = ref(false);
-const { darkMode, sidebarCollapsed, themeIcon } = storeToRefs(appStore);
+const { darkMode, privacyMode, sidebarCollapsed, themeIcon, privacyIcon } = storeToRefs(appStore);
 const { loggedIn, user } = storeToRefs(authStore);
 const showQzoneButton = computed(() => {
   const currentPlatform = platform();
@@ -133,6 +133,15 @@ async function logout() {
       <header class="topbar">
         <div><p class="topbar-eyebrow">QZONE ARCHIVE</p><h1>{{ pageTitle }}</h1></div>
         <div class="topbar-actions">
+          <Button
+            :icon="privacyIcon"
+            :severity="privacyMode ? 'primary' : 'secondary'"
+            :title="privacyMode ? '已开启隐私模式（点击关闭）' : '开启隐私保护模式（隐藏QQ号与模糊预览）'"
+            text
+            rounded
+            aria-label="隐私保护"
+            @click="appStore.togglePrivacy"
+          />
           <Button :icon="themeIcon" severity="secondary" text rounded aria-label="切换主题" @click="appStore.toggleTheme" />
           <button class="account-chip" type="button" :aria-label="loggedIn ? '打开账号菜单' : '登录 QQ 空间'" @click="handleAccountClick">
             <span class="account-avatar">

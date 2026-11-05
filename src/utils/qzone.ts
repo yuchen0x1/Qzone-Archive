@@ -43,6 +43,7 @@ export const listArchiveSkips = () => invoke<ArchiveSkipItem[]>("list_archive_sk
 export const retryArchiveSkip = (id: number) => invoke<ArchiveSkipRetryResult>("retry_archive_skip", { id });
 export const retryAllArchiveSkips = (intervalMs: number) => invoke<ArchiveSkipBatchRetryResult>("retry_all_archive_skips", { intervalMs });
 export const listArchivedFeeds = (limit = 100, offset = 0, category: ArchiveCategory = "self") => invoke<ArchiveItem[]>("list_archived_feeds", { limit, offset, category });
+export const listOnThisDayFeeds = () => invoke<ArchiveItem[]>("list_on_this_day_feeds");
 export const listArchivedMedia = (limit = 60, offset = 0, year?: number) => invoke<ArchiveMediaPage>("list_archived_media", { limit, offset, year });
 export const getArchivedFeed = (id: number) => invoke<ArchiveItem>("get_archived_feed", { id });
 export const countArchivedFeeds = (category: ArchiveCategory = "self") => invoke<number>("count_archived_feeds", { category });
@@ -75,7 +76,11 @@ export const loadRecyclePhotoPreview = (imageUrl: string) => invoke<string>("loa
 
 export interface GuestbookSyncPage { fetched: number; saved: number; total: number; }
 export const syncGuestbookPage = (start: number, num = 20) => invoke<GuestbookSyncPage>("save_guestbook_page", { start, num });
+export interface ShuoshuoSyncPage { fetched: number; saved: number; total: number; }
+export const syncShuoshuoPage = (pos: number, num = 20) => invoke<ShuoshuoSyncPage>("save_shuoshuo_page", { pos, num });
 export interface FriendContact { uin: string; nickname: string; remark?: string; }
+export const fetchFriendList = () => invoke<Record<string, unknown>>("fetch_friend_list");
+export const fetchShuoshuoPage = (pos: number, num = 20) => invoke<Record<string, unknown>>("fetch_shuoshuo_page", { pos, num });
 export const syncFriendList = () => invoke<FriendContact[]>("sync_friend_list");
 export const listFriendContacts = () => invoke<FriendContact[]>("list_friend_contacts");
 export const exportArchivedJson = (category: ArchiveCategory, ids?: number[]) => invoke<string>("export_archived_json", { category, ids });
