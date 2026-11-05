@@ -161,9 +161,20 @@ jobs:
         run: npm ci
       - name: Generate iOS project
         run: npx tauri ios init
+      - name: Build Rust static library for iOS device
+        run: cargo build --release --target aarch64-apple-ios --manifest-path src-tauri/Cargo.toml --lib
+      - name: Preplace library and neutralize rust build phase
+        run: |
+          LIB="src-tauri/target/aarch64-apple-ios/release/libqzonearchive_lib.a"
+          test -f "$LIB" || { ls src-tauri/target/aarch64-apple-ios/release/; exit 1; }
+          for CFG in Release Debug; do
+            mkdir -p "src-tauri/gen/apple/Externals/arm64/$CFG"
+            cp "$LIB" "src-tauri/gen/apple/Externals/arm64/$CFG/"
+          done
+          cd src-tauri/gen/apple
+          sed -i '' 's|npm run -- tauri ios xcode-script|true # rust library prebuilt by cargo|' project.yml
+          xcodegen generate
       - name: Build unsigned app for device
-        env:
-          TAURI_SCRIPT: ${{ github.workspace }}/node_modules/.bin/tauri
         run: |
           PROJ=$(find src-tauri/gen/apple -maxdepth 1 -name "*.xcodeproj" -type d | head -1)
           test -n "$PROJ" || { ls src-tauri/gen/apple; exit 1; }
