@@ -161,19 +161,21 @@ jobs:
         run: npm ci
       - name: Generate iOS project
         run: npx tauri ios init
-      - name: Build Rust static library for iOS device
-        run: cargo build --release --target aarch64-apple-ios --manifest-path src-tauri/Cargo.toml --lib
-      - name: Preplace library and neutralize rust build phase
+      - name: Neutralize rust build phase and regenerate project
         run: |
-          LIB="src-tauri/target/aarch64-apple-ios/release/libqzonearchive_lib.a"
-          test -f "$LIB" || { ls src-tauri/target/aarch64-apple-ios/release/; exit 1; }
-          for CFG in Release Debug; do
-            mkdir -p "src-tauri/gen/apple/Externals/arm64/$CFG"
-            cp "$LIB" "src-tauri/gen/apple/Externals/arm64/$CFG/"
-          done
           cd src-tauri/gen/apple
           sed -i '' 's|npm run -- tauri ios xcode-script|true # rust library prebuilt by cargo|' project.yml
           xcodegen generate
+      - name: Build Rust static library for iOS device
+        run: cargo build --release --target aarch64-apple-ios --manifest-path src-tauri/Cargo.toml --lib
+      - name: Preplace static library
+        run: |
+          LIB="src-tauri/target/aarch64-apple-ios/release/libqzonearchive_lib.a"
+          test -f "$LIB" || { ls src-tauri/target/aarch64-apple-ios/release/; exit 1; }
+          for CFG in release debug; do
+            mkdir -p "src-tauri/gen/apple/Externals/arm64/$CFG"
+            cp "$LIB" "src-tauri/gen/apple/Externals/arm64/$CFG/"
+          done
       - name: Build unsigned app for device
         run: |
           PROJ=$(find src-tauri/gen/apple -maxdepth 1 -name "*.xcodeproj" -type d | head -1)
@@ -183,7 +185,7 @@ jobs:
           echo "Using scheme: $SCHEME"
           xcodebuild -project "$PROJ" \
             -scheme "$SCHEME" \
-            -configuration Release \
+            -configuration release \
             -destination 'generic/platform=iOS' \
             -derivedDataPath src-tauri/gen/apple/build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" \
@@ -191,7 +193,7 @@ jobs:
             build
       - name: Package unsigned ipa
         run: |
-          PRODUCT_DIR="src-tauri/gen/apple/build/Build/Products/Release-iphoneos"
+          PRODUCT_DIR="src-tauri/gen/apple/build/Build/Products/release-iphoneos"
           APP=$(ls -d "$PRODUCT_DIR"/*.app | head -1)
           test -d "$APP" || { ls "$PRODUCT_DIR" 2>/dev/null; exit 1; }
           echo "Packaging: $APP"
