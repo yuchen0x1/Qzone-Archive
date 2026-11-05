@@ -172,9 +172,10 @@ jobs:
         run: |
           LIB="src-tauri/target/aarch64-apple-ios/release/libqzonearchive_lib.a"
           test -f "$LIB" || { ls src-tauri/target/aarch64-apple-ios/release/; exit 1; }
+          # tauri iOS projects link against libapp.a (hardcoded LIB_OUTPUT_FILE_NAME)
           for CFG in release debug; do
             mkdir -p "src-tauri/gen/apple/Externals/arm64/$CFG"
-            cp "$LIB" "src-tauri/gen/apple/Externals/arm64/$CFG/"
+            cp "$LIB" "src-tauri/gen/apple/Externals/arm64/$CFG/libapp.a"
           done
       - name: Build unsigned app for device
         run: |
