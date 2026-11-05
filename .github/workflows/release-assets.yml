@@ -162,6 +162,8 @@ jobs:
       - name: Generate iOS project
         run: npx tauri ios init
       - name: Build unsigned app for device
+        env:
+          TAURI_SCRIPT: ${{ github.workspace }}/node_modules/.bin/tauri
         run: |
           PROJ=$(find src-tauri/gen/apple -maxdepth 1 -name "*.xcodeproj" -type d | head -1)
           test -n "$PROJ" || { ls src-tauri/gen/apple; exit 1; }
