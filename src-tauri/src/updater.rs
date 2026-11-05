@@ -1,5 +1,9 @@
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use serde::Serialize;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter, Manager};
 use url::Url;
 
 /// 一个发布源：latest 接口 + 对应发布页（用于校验发布链接）。
@@ -283,6 +287,227 @@ fn parse_atom_latest(body: &str) -> Result<(String, String), String> {
         .unwrap_or_default()
         .to_string();
     Ok((tag.to_string(), published_at))
+}
+
+// ---------- 应用内下载更新与安装 ----------
+
+/// 更新下载的取消状态：由 `cancel_update_download` 置位，下载循环轮询后中止。
+#[derive(Default)]
+pub struct UpdateDownloadState {
+    cancelled: AtomicBool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateDownloadProgress {
+    name: String,
+    downloaded: u64,
+    total: u64,
+    percent: f64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadedUpdateAsset {
+    path: String,
+    name: String,
+    size: u64,
+}
+
+/// 下载地址白名单：发布源主机，或前端使用的镜像加速前缀（内嵌原 GitHub 地址需完整匹配本仓库）。
+fn is_trusted_download_url(raw: &str) -> bool {
+    if is_trusted_source_url(raw) {
+        return true;
+    }
+    let Ok(url) = Url::parse(raw) else {
+        return false;
+    };
+    let trusted_host = url
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("ghfast.top"));
+    url.scheme() == "https"
+        && url.port().is_none()
+        && trusted_host
+        && url
+            .path()
+            .contains("https://github.com/yuchen0x1/Qzone-Archive/")
+}
+
+fn download_file_name(url: &Url) -> String {
+    let segment = url
+        .path()
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or_default();
+    let cleaned: String = segment
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches('.').to_string();
+    if cleaned.is_empty() {
+        "qzonearchive-update-download".into()
+    } else if cleaned.len() > 120 {
+        cleaned.chars().take(120).collect()
+    } else {
+        cleaned
+    }
+}
+
+/// 应用内下载更新安装包，边下边发 `update-download-progress` 事件；完成后返回本地路径。
+#[tauri::command]
+pub async fn download_update_asset(
+    app: AppHandle,
+    state: tauri::State<'_, UpdateDownloadState>,
+    url: String,
+) -> Result<DownloadedUpdateAsset, String> {
+    if !is_trusted_download_url(&url) {
+        return Err("更新下载地址不受信任".into());
+    }
+    let parsed = Url::parse(&url).map_err(|error| format!("无效的下载地址：{error}"))?;
+    let name = download_file_name(&parsed);
+    state.cancelled.store(false, Ordering::Relaxed);
+
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("无法获取更新缓存目录：{error}"))?
+        .join("update");
+    std::fs::create_dir_all(&dir).map_err(|error| format!("无法创建更新缓存目录：{error}"))?;
+    let target: PathBuf = dir.join(&name);
+    let partial = dir.join(format!("{name}.part"));
+
+    let client = reqwest::Client::builder()
+        .user_agent("qzonearchive-updater")
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(600))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|error| format!("初始化下载客户端失败：{error}"))?;
+    let mut response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| format!("连接更新下载源失败：{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("更新下载源返回 HTTP {}", response.status()));
+    }
+    let total = response.content_length().unwrap_or(0);
+
+    let emit = |downloaded: u64| {
+        let percent = if total > 0 {
+            (downloaded as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
+        let _ = app.emit(
+            "update-download-progress",
+            UpdateDownloadProgress {
+                name: name.clone(),
+                downloaded,
+                total,
+                percent: (percent * 10.0).round() / 10.0,
+            },
+        );
+    };
+
+    let mut file =
+        std::fs::File::create(&partial).map_err(|error| format!("创建更新文件失败：{error}"))?;
+    let mut downloaded: u64 = 0;
+    let mut last_emit = std::time::Instant::now();
+    loop {
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|error| format!("下载更新失败：{error}"))?;
+        let Some(chunk) = chunk else { break };
+        if state.cancelled.load(Ordering::Relaxed) {
+            drop(file);
+            let _ = std::fs::remove_file(&partial);
+            return Err("已取消更新下载".into());
+        }
+        file.write_all(&chunk)
+            .map_err(|error| format!("写入更新文件失败：{error}"))?;
+        downloaded += chunk.len() as u64;
+        if last_emit.elapsed() >= std::time::Duration::from_millis(200) {
+            emit(downloaded);
+            last_emit = std::time::Instant::now();
+        }
+    }
+    file.flush().map_err(|error| format!("写入更新文件失败：{error}"))?;
+    drop(file);
+    emit(downloaded);
+    std::fs::rename(&partial, &target).map_err(|error| format!("保存更新文件失败：{error}"))?;
+    Ok(DownloadedUpdateAsset {
+        path: target.to_string_lossy().into_owned(),
+        name,
+        size: downloaded,
+    })
+}
+
+#[tauri::command]
+pub fn cancel_update_download(state: tauri::State<'_, UpdateDownloadState>) {
+    state.cancelled.store(true, Ordering::Relaxed);
+}
+
+/// 运行已下载的更新安装包。
+/// Windows：先退出应用，再静默安装（`/S`）并由安装器重启（`/R`），全程无需手动点击；
+/// macOS：打开 dmg 镜像；Linux：打开安装包所在目录。
+#[tauri::command]
+pub async fn run_update_installer(app: AppHandle, path: String) -> Result<(), String> {
+    let path = PathBuf::from(&path);
+    if !path.is_file() {
+        return Err("安装包文件不存在，请重新下载".into());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let installer = path.to_string_lossy().into_owned();
+        // 延时 2 秒等本进程完全退出后再安装，避免安装包替换正在运行的 exe 失败
+        let command = format!(
+            r#"ping -n 3 127.0.0.1 >nul & "{}" /S /R"#,
+            installer.replace('"', "")
+        );
+        std::process::Command::new("cmd")
+            .args(["/S", "/C", &command])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|error| format!("启动安装程序失败：{error}"))?;
+        app.exit(0);
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map_err(|error| format!("无法打开安装包：{error}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let dir = path.parent().unwrap_or(std::path::Path::new("."));
+        std::process::Command::new("xdg-open")
+            .arg(dir)
+            .spawn()
+            .map_err(|error| format!("无法打开安装包目录：{error}"))?;
+        return Ok(());
+    }
+
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = path;
+        Err("请在手机上手动安装下载好的安装包".into())
+    }
 }
 
 #[cfg(test)]

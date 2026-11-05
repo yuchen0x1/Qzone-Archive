@@ -1,15 +1,24 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onBeforeUnmount, onMounted, ref } from "vue";
 import Button from "primevue/button";
+import ProgressBar from "primevue/progressbar";
 import { getVersion } from "@tauri-apps/api/app";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   assetForPlatform,
   acceleratedUrl,
+  cancelUpdateDownload,
   checkForUpdate,
+  downloadUpdateAsset,
   formatBytes,
+  runUpdateInstaller,
+  supportsInAppUpdate,
   RELEASES_PAGE_URL,
+  type DownloadedUpdateAsset,
+  type UpdateDownloadProgress,
   type UpdateInfo,
+  type UpdatePlatform,
 } from "../utils/updater";
 import { arch, platform } from "@tauri-apps/plugin-os";
 
@@ -19,12 +28,35 @@ const updateChecked = ref(false);
 const updateInfo = ref<UpdateInfo | null>(null);
 const updateError = ref("");
 
+const currentPlatform = platform() as UpdatePlatform;
+const canUpdateInApp = supportsInAppUpdate(currentPlatform);
+
+type DownloadState = "idle" | "downloading" | "done" | "error";
+const downloadState = ref<DownloadState>("idle");
+const downloadPercent = ref(0);
+const downloadReceived = ref(0);
+const downloadTotal = ref(0);
+const downloadError = ref("");
+const downloadedUpdate = ref<DownloadedUpdateAsset>();
+const installing = ref(false);
+let unlistenProgress: UnlistenFn | undefined;
+
 onMounted(async () => {
   try {
     appVersion.value = await getVersion();
   } catch {
     /* 读取失败不影响页面展示 */
   }
+  unlistenProgress = await listen<UpdateDownloadProgress>("update-download-progress", (event) => {
+    const payload = event.payload;
+    downloadPercent.value = payload.percent;
+    downloadReceived.value = payload.downloaded;
+    downloadTotal.value = payload.total;
+  });
+});
+
+onBeforeUnmount(() => {
+  unlistenProgress?.();
 });
 
 async function checkUpdate() {
@@ -32,6 +64,7 @@ async function checkUpdate() {
   updateChecking.value = true;
   updateChecked.value = false;
   updateError.value = "";
+  resetDownload();
   try {
     updateInfo.value = await checkForUpdate();
   } catch (reason) {
@@ -43,8 +76,85 @@ async function checkUpdate() {
   }
 }
 
+function resetDownload() {
+  downloadState.value = "idle";
+  downloadPercent.value = 0;
+  downloadReceived.value = 0;
+  downloadTotal.value = 0;
+  downloadError.value = "";
+  downloadedUpdate.value = undefined;
+  installing.value = false;
+}
+
 function currentUpdateAsset(info: UpdateInfo) {
   return assetForPlatform(info.assets, platform() as "windows" | "macos" | "linux" | "android" | "ios", arch());
+}
+
+/** 桌面平台走应用内下载；移动端仍交给系统浏览器下载安装包。 */
+async function startUpdate(info: UpdateInfo) {
+  const asset = currentUpdateAsset(info);
+  if (!asset) return;
+  if (!canUpdateInApp) {
+    await openUrl(asset.browser_download_url);
+    return;
+  }
+  downloadState.value = "downloading";
+  downloadPercent.value = 0;
+  downloadReceived.value = 0;
+  downloadTotal.value = asset.size;
+  downloadError.value = "";
+  try {
+    const urls = [asset.browser_download_url];
+    const accelerated = acceleratedUrl(asset.browser_download_url);
+    if (accelerated !== asset.browser_download_url) urls.push(accelerated);
+    let lastError = "";
+    for (const url of urls) {
+      try {
+        downloadedUpdate.value = await downloadUpdateAsset(url);
+        downloadState.value = "done";
+        downloadPercent.value = 100;
+        return;
+      } catch (reason) {
+        lastError = String(reason);
+        if (lastError.includes("取消")) break;
+        resetProgressForRetry();
+      }
+    }
+    throw new Error(lastError);
+  } catch (reason) {
+    downloadState.value = "error";
+    downloadError.value = String(reason);
+  }
+}
+
+function resetProgressForRetry() {
+  downloadPercent.value = 0;
+  downloadReceived.value = 0;
+}
+
+async function cancelDownload() {
+  try {
+    await cancelUpdateDownload();
+  } catch {
+    /* 取消失败时下载会自行超时结束 */
+  }
+}
+
+async function installUpdate() {
+  if (!downloadedUpdate.value || installing.value) return;
+  installing.value = true;
+  downloadError.value = "";
+  try {
+    await runUpdateInstaller(downloadedUpdate.value.path);
+    // Windows 下应用随即退出；其余平台弹出系统安装界面或目录
+  } catch (reason) {
+    installing.value = false;
+    downloadError.value = String(reason);
+  }
+}
+
+function installButtonLabel() {
+  return currentPlatform === "windows" ? "立即安装并重启" : "立即安装";
 }
 
 interface ChangelogEntry {
@@ -54,6 +164,15 @@ interface ChangelogEntry {
 }
 
 const CHANGELOG: ChangelogEntry[] = [
+  {
+    version: "1.3.2",
+    date: "2026-11-06",
+    highlights: [
+      "软件更新支持应用内下载：带实时进度条与取消操作",
+      "新增「立即安装并重启」：Windows 静默安装后自动重启应用",
+      "下载失败自动回退加速镜像重试",
+    ],
+  },
   {
     version: "1.3.1",
     date: "2026-11-06",
@@ -162,11 +281,28 @@ function isCurrentVersion(version: string) {
               <small>{{ currentUpdateAsset(updateInfo) ? `${currentUpdateAsset(updateInfo)!.name} · ${formatBytes(currentUpdateAsset(updateInfo)!.size)}` : "请在发布页手动下载" }}</small>
             </div>
           </div>
-          <div class="about-links">
-            <Button v-if="currentUpdateAsset(updateInfo)" label="下载对应安装包" icon="pi pi-download" @click="openUrl(currentUpdateAsset(updateInfo)!.browser_download_url)" />
+
+          <div v-if="downloadState === 'downloading' || downloadState === 'done'" class="update-download">
+            <ProgressBar :value="downloadState === 'done' ? 100 : downloadPercent" :show-value="false" :class="{ 'is-done': downloadState === 'done' }" style="height: 7px" />
+            <div class="update-download-row">
+              <small v-if="downloadState === 'downloading'">
+                {{ canUpdateInApp ? "正在下载更新" : "正在下载安装包" }} {{ downloadPercent.toFixed(1) }}% · {{ formatBytes(downloadReceived) }}<template v-if="downloadTotal"> / {{ formatBytes(downloadTotal) }}</template>
+              </small>
+              <small v-else>
+                <i class="pi pi-check-circle" /> 下载完成 · {{ formatBytes(downloadedUpdate?.size ?? 0) }}{{ currentPlatform === "windows" ? "，安装后应用会自动重启" : "" }}
+              </small>
+              <Button v-if="downloadState === 'downloading'" label="取消下载" size="small" severity="secondary" text @click="cancelDownload" />
+              <Button v-else :label="installing ? '正在启动安装…' : installButtonLabel()" icon="pi pi-play" size="small" :loading="installing" @click="installUpdate" />
+            </div>
+          </div>
+
+          <div v-else class="about-links">
+            <Button v-if="currentUpdateAsset(updateInfo)" :label="canUpdateInApp ? '下载更新' : '下载安装包'" icon="pi pi-download" @click="startUpdate(updateInfo)" />
             <Button label="发布页" icon="pi pi-external-link" severity="secondary" outlined @click="openUrl(updateInfo.release_url)" />
             <Button v-if="acceleratedUrl(updateInfo.release_url) !== updateInfo.release_url" label="加速打开" icon="pi pi-bolt" severity="secondary" outlined @click="openUrl(acceleratedUrl(updateInfo.release_url))" />
           </div>
+
+          <p v-if="downloadError" class="update-download-error"><i class="pi pi-exclamation-circle" />{{ downloadError }}</p>
         </div>
       </div>
     </article>

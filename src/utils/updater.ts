@@ -37,6 +37,38 @@ export function checkForUpdate(): Promise<UpdateInfo | null> {
   return invoke<UpdateInfo | null>("check_for_update");
 }
 
+export interface UpdateDownloadProgress {
+  name: string;
+  downloaded: number;
+  total: number;
+  percent: number;
+}
+
+export interface DownloadedUpdateAsset {
+  path: string;
+  name: string;
+  size: number;
+}
+
+/** 应用内下载更新安装包（后端流式下载并通过 update-download-progress 事件上报进度）。 */
+export function downloadUpdateAsset(url: string): Promise<DownloadedUpdateAsset> {
+  return invoke<DownloadedUpdateAsset>("download_update_asset", { url });
+}
+
+export function cancelUpdateDownload(): Promise<void> {
+  return invoke<void>("cancel_update_download");
+}
+
+/** 运行已下载的安装包：Windows 会先退出应用再静默安装并自动重启。 */
+export function runUpdateInstaller(path: string): Promise<void> {
+  return invoke<void>("run_update_installer", { path });
+}
+
+/** 是否支持应用内下载与一键安装（桌面平台）。 */
+export function supportsInAppUpdate(currentPlatform: UpdatePlatform): boolean {
+  return currentPlatform === "windows" || currentPlatform === "macos" || currentPlatform === "linux";
+}
+
 export function formatBytes(size: number): string {
   if (!size) return "未知大小";
   if (size >= 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)} MB`;

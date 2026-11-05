@@ -124,7 +124,15 @@
 .update-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .update-text h4 { margin: 0 0 4px; }
 .update-text .archive-error { margin: 0; }
-.update-available { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 14px; padding: 13px 16px; border: 1px solid color-mix(in srgb,var(--primary) 30%,var(--border)); border-radius: 12px; background: color-mix(in srgb,var(--primary) 7%,transparent); }
+.update-available { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 14px; padding: 13px 16px; border: 1px solid color-mix(in srgb,var(--primary) 30%,var(--border)); border-radius: 12px; background: color-mix(in srgb,var(--primary) 7%,transparent); flex-wrap: wrap; }
+.update-download { display: grid; flex: 1 1 100%; gap: 8px; }
+.update-download-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.update-download-row small { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.update-download-row small .pi-check-circle { color: #10b981; }
+.update-download .p-progressbar { background: color-mix(in srgb, var(--primary) 12%, transparent); }
+.update-download .p-progressbar-value { background: linear-gradient(90deg, var(--primary), #06b6d4); }
+.update-download .p-progressbar.is-done .p-progressbar-value { background: linear-gradient(90deg, #10b981, #34d399); }
+.update-download-error { display: flex; align-items: center; gap: 6px; flex: 1 1 100%; margin: 8px 0 0; color: #e45858; font-size: 12px; }
 .update-meta { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .update-meta > .pi { color: var(--primary); font-size: 18px; }
 .update-meta strong { display: block; }

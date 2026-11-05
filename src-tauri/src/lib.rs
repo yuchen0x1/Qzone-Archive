@@ -17,6 +17,7 @@ pub fn run() {
         .manage(albums::AlbumState::new())
         .manage(qlogin::QLoginState::new())
         .manage(qzone::RecycleAuthState::default())
+        .manage(updater::UpdateDownloadState::default())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_dialog::init())
@@ -25,6 +26,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             exit_app,
             updater::check_for_update,
+            updater::download_update_asset,
+            updater::cancel_update_download,
+            updater::run_update_installer,
             qlogin::start_qr_login,
             qlogin::poll_qr_login,
             qlogin::get_login_status,
