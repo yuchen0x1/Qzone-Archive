@@ -27,6 +27,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+      - name: Install frontend dependencies
+        run: npm ci
       - name: Build universal app
         run: npx tauri build --target universal-apple-darwin
       - name: Upload dmg artifact
@@ -48,6 +50,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+      - name: Install frontend dependencies
+        run: npm ci
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -88,6 +92,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+      - name: Install frontend dependencies
+        run: npm ci
       - name: Restore signing keystore
         run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/qzone-release.keystore"
       - name: Build universal APK
@@ -129,6 +135,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+      - name: Install frontend dependencies
+        run: npm ci
       - name: Generate iOS project
         run: npx tauri ios init
       - name: Build unsigned app for device
