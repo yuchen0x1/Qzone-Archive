@@ -1,7 +1,6 @@
 name: Release Assets
 
-# 手动触发：为已有 Release 标签补齐 macOS / Linux / iOS 构建产物
-# Android 由维护者在本地构建上传（需要 Android SDK + NDK 环境）。
+# 手动触发：为已有 Release 标签补齐 macOS / Linux / Android / iOS 构建产物。
 on:
   workflow_dispatch:
     inputs:
@@ -70,6 +69,52 @@ jobs:
           path: src-tauri/target/release/bundle/appimage/*.AppImage
           if-no-files-found: error
 
+  android:
+    name: Android (signed apk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Restore signing keystore
+        run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/qzone-release.keystore"
+      - name: Build universal APK
+        env:
+          TAURI_STORE_FILE: ${{ runner.temp }}/qzone-release.keystore
+          TAURI_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          TAURI_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          TAURI_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          NDK_VERSION=$(ls "$ANDROID_HOME/ndk" | head -1)
+          export NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
+          echo "Using NDK: $NDK_HOME"
+          npx tauri android build --apk
+      - name: Rename APK
+        run: |
+          VERSION="${{ inputs.tag }}"
+          VERSION="${VERSION#v}"
+          APK="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk"
+          test -f "$APK" || { find src-tauri/gen/android/app/build/outputs/apk -name "*.apk"; exit 1; }
+          cp "$APK" "QzoneArchive_${VERSION}_android-universal.apk"
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: QzoneArchive_*_android-universal.apk
+          if-no-files-found: error
+
   ios:
     name: iOS (unsigned ipa)
     runs-on: macos-latest
@@ -112,7 +157,7 @@ jobs:
 
   publish:
     name: Upload to release
-    needs: [macos, linux, ios]
+    needs: [macos, linux, android, ios]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts

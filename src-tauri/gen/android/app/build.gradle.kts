@@ -16,6 +16,18 @@ val tauriProperties = Properties().apply {
 android {
     compileSdk = 36
     namespace = "top.ehre.qzonearchive"
+    signingConfigs {
+        create("release") {
+            val env = System.getenv()
+            val storeFilePath = env["TAURI_STORE_FILE"]
+            if (storeFilePath != null) {
+                storeFile = file(storeFilePath)
+                storePassword = env["TAURI_STORE_PASSWORD"]
+                keyAlias = env["TAURI_KEY_ALIAS"]
+                keyPassword = env["TAURI_KEY_PASSWORD"]
+            }
+        }
+    }
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
         applicationId = "top.ehre.qzonearchive"
@@ -43,6 +55,9 @@ android {
                     .plus(getDefaultProguardFile("proguard-android-optimize.txt"))
                     .toList().toTypedArray()
             )
+            if (System.getenv("TAURI_STORE_FILE") != null) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
     kotlinOptions {
