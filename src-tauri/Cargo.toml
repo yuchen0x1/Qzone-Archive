@@ -38,6 +38,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 zip = { version = "9", default-features = false, features = ["deflate"] }
 filetime = "0.2.29"
 
+# Backport the upstream VariantStrIter pointer-mutability fix until GTK's
+# dependency chain can move to glib >= 0.20.
+[patch.crates-io]
+glib = { path = "vendor/glib" }
+
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39.1"
 windows = "0.62.2"
