@@ -302,6 +302,8 @@ pub(crate) fn open_database(app: &tauri::AppHandle) -> Result<Connection, String
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|error| format!("读取归档数据库版本失败：{error}"))?;
     if schema_version >= DATABASE_SCHEMA_VERSION {
+        init_search_index(&mut connection)?;
+        init_global_search_index(&mut connection)?;
         return Ok(connection);
     }
     connection
@@ -456,10 +458,235 @@ pub(crate) fn open_database(app: &tauri::AppHandle) -> Result<Connection, String
     }
     migrate_legacy_dynamics(&mut connection)?;
     migrate_dynamic_categories(&mut connection)?;
+    init_search_index(&mut connection)?;
+    init_global_search_index(&mut connection)?;
     connection
         .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
         .map_err(|error| format!("写入归档数据库版本失败：{error}"))?;
     Ok(connection)
+}
+
+/// 全文搜索索引：对 archive_dynamics 的正文与作者建立 FTS5 虚拟表，
+/// 用触发器增量维护，首次建表时全量填充历史数据。
+fn init_search_index(connection: &mut Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "
+         CREATE VIRTUAL TABLE IF NOT EXISTS archive_search USING fts5(
+           content, author_name, cell_id, owner_uin,
+           tokenize = 'unicode61'
+         );
+         CREATE TRIGGER IF NOT EXISTS archive_search_ai AFTER INSERT ON archive_dynamics BEGIN
+           INSERT INTO archive_search(rowid, content, author_name, cell_id, owner_uin)
+           VALUES (new.id, new.content, new.author_name, new.cell_id, new.owner_uin);
+         END;
+         CREATE TRIGGER IF NOT EXISTS archive_search_ad AFTER DELETE ON archive_dynamics BEGIN
+           INSERT INTO archive_search(archive_search, rowid, content, author_name, cell_id, owner_uin)
+           VALUES ('delete', old.id, old.content, old.author_name, old.cell_id, old.owner_uin);
+         END;
+         CREATE TRIGGER IF NOT EXISTS archive_search_au AFTER UPDATE ON archive_dynamics BEGIN
+           INSERT INTO archive_search(archive_search, rowid, content, author_name, cell_id, owner_uin)
+           VALUES ('delete', old.id, old.content, old.author_name, old.cell_id, old.owner_uin);
+           INSERT INTO archive_search(rowid, content, author_name, cell_id, owner_uin)
+           VALUES (new.id, new.content, new.author_name, new.cell_id, new.owner_uin);
+         END;
+         ",
+        )
+        .map_err(|error| format!("初始化全文搜索索引失败：{error}"))?;
+    // 首次建表后，把已有动态全量写入索引。
+    let has_rows: i64 = connection
+        .query_row("SELECT COUNT(*) FROM archive_search", [], |row| row.get(0))
+        .map_err(|error| format!("检查搜索索引失败：{error}"))?;
+    if has_rows == 0 {
+        connection
+            .execute_batch(
+                "INSERT INTO archive_search(rowid, content, author_name, cell_id, owner_uin)
+                 SELECT id, content, author_name, cell_id, owner_uin FROM archive_dynamics;",
+            )
+            .map_err(|error| format!("填充搜索索引失败：{error}"))?;
+    }
+    Ok(())
+}
+
+fn init_global_search_index(connection: &mut Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "
+         CREATE TABLE IF NOT EXISTS archive_search_documents (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           owner_uin TEXT NOT NULL,
+           kind TEXT NOT NULL,
+           ref_id INTEGER NOT NULL,
+           cell_id TEXT,
+           title TEXT,
+           body TEXT,
+           author_name TEXT,
+           created_at INTEGER NOT NULL DEFAULT 0,
+           UNIQUE(owner_uin, kind, ref_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_archive_search_documents_owner
+           ON archive_search_documents(owner_uin, created_at DESC);
+         CREATE VIRTUAL TABLE IF NOT EXISTS archive_global_search USING fts5(
+           title, body, author_name,
+           owner_uin UNINDEXED, kind UNINDEXED, cell_id UNINDEXED,
+           tokenize = 'unicode61'
+         );
+         CREATE TABLE IF NOT EXISTS archive_search_meta (
+           key TEXT PRIMARY KEY,
+           value TEXT NOT NULL
+         );
+         CREATE TRIGGER IF NOT EXISTS archive_search_dynamics_ai AFTER INSERT ON archive_dynamics BEGIN
+           INSERT INTO archive_search_documents(owner_uin,kind,ref_id,cell_id,body,author_name,created_at)
+           VALUES (new.owner_uin,'dynamic',new.id,new.cell_id,new.content,new.author_name,new.published_at)
+           ON CONFLICT(owner_uin,kind,ref_id) DO UPDATE SET cell_id=excluded.cell_id,body=excluded.body,author_name=excluded.author_name,created_at=excluded.created_at;
+           DELETE FROM archive_global_search WHERE rowid=(SELECT id FROM archive_search_documents WHERE owner_uin=new.owner_uin AND kind='dynamic' AND ref_id=new.id);
+           INSERT INTO archive_global_search(rowid,title,body,author_name,owner_uin,kind,cell_id)
+           SELECT id,title,body,author_name,owner_uin,kind,cell_id FROM archive_search_documents
+           WHERE owner_uin=new.owner_uin AND kind='dynamic' AND ref_id=new.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS archive_search_dynamics_au AFTER UPDATE ON archive_dynamics BEGIN
+           INSERT INTO archive_search_documents(owner_uin,kind,ref_id,cell_id,body,author_name,created_at)
+           VALUES (new.owner_uin,'dynamic',new.id,new.cell_id,new.content,new.author_name,new.published_at)
+           ON CONFLICT(owner_uin,kind,ref_id) DO UPDATE SET cell_id=excluded.cell_id,body=excluded.body,author_name=excluded.author_name,created_at=excluded.created_at;
+           DELETE FROM archive_global_search WHERE rowid=(SELECT id FROM archive_search_documents WHERE owner_uin=new.owner_uin AND kind='dynamic' AND ref_id=new.id);
+           INSERT INTO archive_global_search(rowid,title,body,author_name,owner_uin,kind,cell_id)
+           SELECT id,title,body,author_name,owner_uin,kind,cell_id FROM archive_search_documents
+           WHERE owner_uin=new.owner_uin AND kind='dynamic' AND ref_id=new.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS archive_search_dynamics_ad AFTER DELETE ON archive_dynamics BEGIN
+           DELETE FROM archive_global_search WHERE rowid=(SELECT id FROM archive_search_documents WHERE owner_uin=old.owner_uin AND kind='dynamic' AND ref_id=old.id);
+           DELETE FROM archive_search_documents WHERE owner_uin=old.owner_uin AND kind='dynamic' AND ref_id=old.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS archive_search_feeds_ai AFTER INSERT ON archive_feeds
+           WHEN new.event_type IN (2,311) BEGIN
+           INSERT INTO archive_search_documents(owner_uin,kind,ref_id,cell_id,body,author_name,created_at)
+           VALUES (new.owner_uin,'comment',new.id,new.cell_id,COALESCE(new.content,new.event_summary),new.actor_name,new.event_time)
+           ON CONFLICT(owner_uin,kind,ref_id) DO UPDATE SET cell_id=excluded.cell_id,body=excluded.body,author_name=excluded.author_name,created_at=excluded.created_at;
+           DELETE FROM archive_global_search WHERE rowid=(SELECT id FROM archive_search_documents WHERE owner_uin=new.owner_uin AND kind='comment' AND ref_id=new.id);
+           INSERT INTO archive_global_search(rowid,title,body,author_name,owner_uin,kind,cell_id)
+           SELECT id,title,body,author_name,owner_uin,kind,cell_id FROM archive_search_documents
+           WHERE owner_uin=new.owner_uin AND kind='comment' AND ref_id=new.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS archive_search_feeds_au_old AFTER UPDATE ON archive_feeds
+           WHEN old.event_type IN (2,311) BEGIN
+           DELETE FROM archive_global_search WHERE rowid=(SELECT id FROM archive_search_documents WHERE owner_uin=old.owner_uin AND kind='comment' AND ref_id=old.id);
+           DELETE FROM archive_search_documents WHERE owner_uin=old.owner_uin AND kind='comment' AND ref_id=old.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS archive_search_feeds_au_new AFTER UPDATE ON archive_feeds
+           WHEN new.event_type IN (2,311) BEGIN
+           INSERT INTO archive_search_documents(owner_uin,kind,ref_id,cell_id,body,author_name,created_at)
+           VALUES (new.owner_uin,'comment',new.id,new.cell_id,COALESCE(new.content,new.event_summary),new.actor_name,new.event_time)
+           ON CONFLICT(owner_uin,kind,ref_id) DO UPDATE SET cell_id=excluded.cell_id,body=excluded.body,author_name=excluded.author_name,created_at=excluded.created_at;
+           DELETE FROM archive_global_search WHERE rowid=(SELECT id FROM archive_search_documents WHERE owner_uin=new.owner_uin AND kind='comment' AND ref_id=new.id);
+           INSERT INTO archive_global_search(rowid,title,body,author_name,owner_uin,kind,cell_id)
+           SELECT id,title,body,author_name,owner_uin,kind,cell_id FROM archive_search_documents
+           WHERE owner_uin=new.owner_uin AND kind='comment' AND ref_id=new.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS archive_search_feeds_ad AFTER DELETE ON archive_feeds
+           WHEN old.event_type IN (2,311) BEGIN
+           DELETE FROM archive_global_search WHERE rowid=(SELECT id FROM archive_search_documents WHERE owner_uin=old.owner_uin AND kind='comment' AND ref_id=old.id);
+           DELETE FROM archive_search_documents WHERE owner_uin=old.owner_uin AND kind='comment' AND ref_id=old.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS archive_search_albums_ai AFTER INSERT ON archive_albums BEGIN
+           INSERT INTO archive_search_documents(owner_uin,kind,ref_id,title,body,created_at)
+           VALUES (new.owner_uin,'album',new.id,new.name,new.description,COALESCE(new.modify_time,new.create_time,0))
+           ON CONFLICT(owner_uin,kind,ref_id) DO UPDATE SET title=excluded.title,body=excluded.body,created_at=excluded.created_at;
+           DELETE FROM archive_global_search WHERE rowid=(SELECT id FROM archive_search_documents WHERE owner_uin=new.owner_uin AND kind='album' AND ref_id=new.id);
+           INSERT INTO archive_global_search(rowid,title,body,author_name,owner_uin,kind,cell_id)
+           SELECT id,title,body,author_name,owner_uin,kind,cell_id FROM archive_search_documents
+           WHERE owner_uin=new.owner_uin AND kind='album' AND ref_id=new.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS archive_search_albums_au AFTER UPDATE ON archive_albums BEGIN
+           INSERT INTO archive_search_documents(owner_uin,kind,ref_id,title,body,created_at)
+           VALUES (new.owner_uin,'album',new.id,new.name,new.description,COALESCE(new.modify_time,new.create_time,0))
+           ON CONFLICT(owner_uin,kind,ref_id) DO UPDATE SET title=excluded.title,body=excluded.body,created_at=excluded.created_at;
+           DELETE FROM archive_global_search WHERE rowid=(SELECT id FROM archive_search_documents WHERE owner_uin=new.owner_uin AND kind='album' AND ref_id=new.id);
+           INSERT INTO archive_global_search(rowid,title,body,author_name,owner_uin,kind,cell_id)
+           SELECT id,title,body,author_name,owner_uin,kind,cell_id FROM archive_search_documents
+           WHERE owner_uin=new.owner_uin AND kind='album' AND ref_id=new.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS archive_search_albums_ad AFTER DELETE ON archive_albums BEGIN
+           DELETE FROM archive_global_search WHERE rowid=(SELECT id FROM archive_search_documents WHERE owner_uin=old.owner_uin AND kind='album' AND ref_id=old.id);
+           DELETE FROM archive_search_documents WHERE owner_uin=old.owner_uin AND kind='album' AND ref_id=old.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS archive_search_photos_ai AFTER INSERT ON archive_album_photos BEGIN
+           INSERT INTO archive_search_documents(owner_uin,kind,ref_id,cell_id,title,body,created_at)
+           VALUES (new.owner_uin,'photo',new.id,new.album_id,new.name,new.description,COALESCE(new.upload_time,0))
+           ON CONFLICT(owner_uin,kind,ref_id) DO UPDATE SET cell_id=excluded.cell_id,title=excluded.title,body=excluded.body,created_at=excluded.created_at;
+           DELETE FROM archive_global_search WHERE rowid=(SELECT id FROM archive_search_documents WHERE owner_uin=new.owner_uin AND kind='photo' AND ref_id=new.id);
+           INSERT INTO archive_global_search(rowid,title,body,author_name,owner_uin,kind,cell_id)
+           SELECT id,title,body,author_name,owner_uin,kind,cell_id FROM archive_search_documents
+           WHERE owner_uin=new.owner_uin AND kind='photo' AND ref_id=new.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS archive_search_photos_au AFTER UPDATE ON archive_album_photos BEGIN
+           INSERT INTO archive_search_documents(owner_uin,kind,ref_id,cell_id,title,body,created_at)
+           VALUES (new.owner_uin,'photo',new.id,new.album_id,new.name,new.description,COALESCE(new.upload_time,0))
+           ON CONFLICT(owner_uin,kind,ref_id) DO UPDATE SET cell_id=excluded.cell_id,title=excluded.title,body=excluded.body,created_at=excluded.created_at;
+           DELETE FROM archive_global_search WHERE rowid=(SELECT id FROM archive_search_documents WHERE owner_uin=new.owner_uin AND kind='photo' AND ref_id=new.id);
+           INSERT INTO archive_global_search(rowid,title,body,author_name,owner_uin,kind,cell_id)
+           SELECT id,title,body,author_name,owner_uin,kind,cell_id FROM archive_search_documents
+           WHERE owner_uin=new.owner_uin AND kind='photo' AND ref_id=new.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS archive_search_photos_ad AFTER DELETE ON archive_album_photos BEGIN
+           DELETE FROM archive_global_search WHERE rowid=(SELECT id FROM archive_search_documents WHERE owner_uin=old.owner_uin AND kind='photo' AND ref_id=old.id);
+           DELETE FROM archive_search_documents WHERE owner_uin=old.owner_uin AND kind='photo' AND ref_id=old.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS archive_search_contacts_ai AFTER INSERT ON friend_contacts BEGIN
+           INSERT INTO archive_search_documents(owner_uin,kind,ref_id,title,body,author_name,created_at)
+           VALUES (new.owner_uin,'contact',new.rowid,new.nickname,new.remark,new.nickname,new.archived_at)
+           ON CONFLICT(owner_uin,kind,ref_id) DO UPDATE SET title=excluded.title,body=excluded.body,author_name=excluded.author_name,created_at=excluded.created_at;
+           DELETE FROM archive_global_search WHERE rowid=(SELECT id FROM archive_search_documents WHERE owner_uin=new.owner_uin AND kind='contact' AND ref_id=new.rowid);
+           INSERT INTO archive_global_search(rowid,title,body,author_name,owner_uin,kind,cell_id)
+           SELECT id,title,body,author_name,owner_uin,kind,cell_id FROM archive_search_documents
+           WHERE owner_uin=new.owner_uin AND kind='contact' AND ref_id=new.rowid;
+         END;
+         CREATE TRIGGER IF NOT EXISTS archive_search_contacts_au AFTER UPDATE ON friend_contacts BEGIN
+           INSERT INTO archive_search_documents(owner_uin,kind,ref_id,title,body,author_name,created_at)
+           VALUES (new.owner_uin,'contact',new.rowid,new.nickname,new.remark,new.nickname,new.archived_at)
+           ON CONFLICT(owner_uin,kind,ref_id) DO UPDATE SET title=excluded.title,body=excluded.body,author_name=excluded.author_name,created_at=excluded.created_at;
+           DELETE FROM archive_global_search WHERE rowid=(SELECT id FROM archive_search_documents WHERE owner_uin=new.owner_uin AND kind='contact' AND ref_id=new.rowid);
+           INSERT INTO archive_global_search(rowid,title,body,author_name,owner_uin,kind,cell_id)
+           SELECT id,title,body,author_name,owner_uin,kind,cell_id FROM archive_search_documents
+           WHERE owner_uin=new.owner_uin AND kind='contact' AND ref_id=new.rowid;
+         END;
+         CREATE TRIGGER IF NOT EXISTS archive_search_contacts_ad AFTER DELETE ON friend_contacts BEGIN
+           DELETE FROM archive_global_search WHERE rowid=(SELECT id FROM archive_search_documents WHERE owner_uin=old.owner_uin AND kind='contact' AND ref_id=old.rowid);
+           DELETE FROM archive_search_documents WHERE owner_uin=old.owner_uin AND kind='contact' AND ref_id=old.rowid;
+         END;
+         ",
+        )
+        .map_err(|error| format!("初始化全局搜索索引失败：{error}"))?;
+
+    let version = connection
+        .query_row(
+            "SELECT value FROM archive_search_meta WHERE key='global-index-version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_default();
+    if version != "1" {
+        connection
+            .execute_batch(
+                "DELETE FROM archive_global_search;
+                 DELETE FROM archive_search_documents;
+                 INSERT INTO archive_search_documents(owner_uin,kind,ref_id,cell_id,body,author_name,created_at)
+                   SELECT owner_uin,'dynamic',id,cell_id,content,author_name,published_at FROM archive_dynamics;
+                 INSERT INTO archive_search_documents(owner_uin,kind,ref_id,cell_id,body,author_name,created_at)
+                   SELECT owner_uin,'comment',id,cell_id,COALESCE(content,event_summary),actor_name,event_time FROM archive_feeds WHERE event_type IN (2,311);
+                 INSERT INTO archive_search_documents(owner_uin,kind,ref_id,title,body,created_at)
+                   SELECT owner_uin,'album',id,name,description,COALESCE(modify_time,create_time,0) FROM archive_albums;
+                 INSERT INTO archive_search_documents(owner_uin,kind,ref_id,cell_id,title,body,created_at)
+                   SELECT owner_uin,'photo',id,album_id,name,description,COALESCE(upload_time,0) FROM archive_album_photos;
+                 INSERT INTO archive_search_documents(owner_uin,kind,ref_id,title,body,author_name,created_at)
+                   SELECT owner_uin,'contact',rowid,nickname,remark,nickname,archived_at FROM friend_contacts;
+                 INSERT INTO archive_global_search(rowid,title,body,author_name,owner_uin,kind,cell_id)
+                   SELECT id,title,body,author_name,owner_uin,kind,cell_id FROM archive_search_documents;
+                 INSERT INTO archive_search_meta(key,value) VALUES ('global-index-version','1')
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value;",
+            )
+            .map_err(|error| format!("构建全局搜索索引失败：{error}"))?;
+    }
+    Ok(())
 }
 
 fn migrate_dynamic_categories(connection: &mut Connection) -> Result<(), String> {
@@ -2365,6 +2592,296 @@ pub async fn list_archived_feeds(
     .map_err(|error| format!("归档查询任务异常退出：{error}"))?
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    kind: String,
+    ref_id: i64,
+    cell_id: Option<String>,
+    title: Option<String>,
+    snippet: String,
+    author_name: Option<String>,
+    created_at: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResult {
+    items: Vec<ArchiveItem>,
+    hits: Vec<SearchHit>,
+    total: u32,
+}
+
+/// 全局全文搜索：跨当前账号全部动态，匹配正文与作者昵称。
+/// 优先走 FTS5 虚拟表，库未建索引时回退为 LIKE 子串匹配。
+#[tauri::command]
+pub async fn global_search(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    keyword: String,
+    limit: u32,
+    offset: u32,
+) -> Result<SearchResult, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    let keyword = keyword.trim().to_string();
+    if keyword.is_empty() {
+        return Err("搜索关键词不能为空".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        search_all(&app, &owner_uin, &keyword, limit, offset)
+    })
+    .await
+    .map_err(|error| format!("搜索任务异常退出：{error}"))?
+}
+
+fn search_all(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+    keyword: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<SearchResult, String> {
+    let connection = open_database(app)?;
+    let has_fts: bool = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='archive_search'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count > 0)
+        .unwrap_or(false);
+
+    // FTS5 前缀匹配：每个有效词转 "词"*，空格连接的词默认 AND。
+    // 纯符号关键词过滤后为空，回退 LIKE 子串匹配，避免 FTS 语法错误。
+    let mut matcher = String::new();
+    for token in keyword
+        .split_whitespace()
+        .filter(|token| token.chars().any(|character| character.is_alphanumeric()))
+    {
+        if !matcher.is_empty() {
+            matcher.push(' ');
+        }
+        matcher.push('"');
+        matcher.push_str(&token.replace('"', ""));
+        matcher.push_str("\"*");
+    }
+    let use_fts = has_fts && !matcher.is_empty();
+
+    let (rows_sql, params_vals, count_sql, count_params): (
+        String,
+        Vec<String>,
+        String,
+        Vec<String>,
+    ) = if use_fts {
+        (
+                "SELECT d.id,d.owner_uin,d.cell_id,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
+                   (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type=217),
+                   (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type IN (2,311))
+                  FROM archive_search s
+                  JOIN archive_dynamics d ON d.id = s.rowid
+                  WHERE archive_search MATCH ?1 AND s.owner_uin=?2
+                  ORDER BY rank, d.published_at DESC LIMIT ?3 OFFSET ?4"
+                    .to_string(),
+                vec![matcher.clone(), owner_uin.to_string(), limit.to_string(), offset.to_string()],
+                "SELECT COUNT(*) FROM archive_search s WHERE archive_search MATCH ?1 AND s.owner_uin=?2".to_string(),
+                vec![matcher, owner_uin.to_string()],
+            )
+    } else {
+        let like = format!("%{keyword}%");
+        (
+                "SELECT id,owner_uin,cell_id,published_at,content,author_uin,author_name,pictures_json,video_json,
+                   0,0 FROM archive_dynamics
+                   WHERE owner_uin=?1 AND (content LIKE ?2 OR author_name LIKE ?2)
+                   ORDER BY published_at DESC LIMIT ?3 OFFSET ?4"
+                    .to_string(),
+                vec![owner_uin.to_string(), like.clone(), limit.to_string(), offset.to_string()],
+                "SELECT COUNT(*) FROM archive_dynamics WHERE owner_uin=?1 AND (content LIKE ?2 OR author_name LIKE ?2)".to_string(),
+                vec![owner_uin.to_string(), like],
+            )
+    };
+
+    let _dynamic_total: u32 = {
+        let mut stmt = connection
+            .prepare(&count_sql)
+            .map_err(|error| format!("准备搜索计数失败：{error}"))?;
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(count_params.iter()))
+            .map_err(|error| format!("搜索计数失败：{error}"))?;
+        let count = rows
+            .next()
+            .map_err(|error| format!("搜索计数失败：{error}"))?;
+        count.and_then(|row| row.get(0).ok()).unwrap_or(0)
+    };
+
+    let items = {
+        let mut statement = connection
+            .prepare(&rows_sql)
+            .map_err(|error| format!("准备搜索查询失败：{error}"))?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(params_vals.iter()), |row| {
+                let video_json = row.get::<_, Option<String>>(8)?;
+                let video_urls = video_urls(video_json.clone());
+                Ok(ArchiveItem {
+                    id: row.get(0)?,
+                    owner_uin: row.get(1)?,
+                    cell_id: row.get(2)?,
+                    published_at: row.get(3)?,
+                    content: row.get(4)?,
+                    author_uin: row.get(5)?,
+                    author_name: row.get(6)?,
+                    picture_urls: picture_urls(row.get(7)?),
+                    video_url: video_urls.first().cloned(),
+                    video_urls,
+                    video_cover_url: video_cover_url(video_json),
+                    like_count: row.get(9)?,
+                    comment_count: row.get(10)?,
+                    likes: vec![],
+                    comments: vec![],
+                })
+            })
+            .map_err(|error| format!("执行搜索失败：{error}"))?;
+        let mut items = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("读取搜索结果失败：{error}"))?;
+
+        // 补充评论与点赞
+        let mut comment_statement = connection
+            .prepare(
+                "SELECT comments_json,actor_uin,actor_name,event_summary,event_time FROM archive_feeds
+             WHERE owner_uin=?1 AND cell_id=?2 AND event_type IN (2,311) ORDER BY event_time ASC",
+            )
+            .map_err(|error| format!("准备评论查询失败：{error}"))?;
+        for item in &mut items {
+            let comments = comment_statement
+                .query_map(params![item.owner_uin, item.cell_id], |row| {
+                    Ok(comment_from_values(
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .map_err(|error| format!("查询动态评论失败：{error}"))?;
+            item.comments = merge_comments(comments.filter_map(Result::ok));
+        }
+        drop(comment_statement);
+        let mut like_statement = connection
+            .prepare(
+                "SELECT actor_uin,actor_name FROM archive_feeds
+             WHERE owner_uin=?1 AND cell_id=?2 AND event_type=217 ORDER BY event_time ASC",
+            )
+            .map_err(|error| format!("准备点赞查询失败：{error}"))?;
+        for item in &mut items {
+            let likes = like_statement
+                .query_map(params![item.owner_uin, item.cell_id], |row| {
+                    Ok(LikeUser {
+                        uin: row.get(0)?,
+                        nickname: row.get(1)?,
+                    })
+                })
+                .map_err(|error| format!("查询点赞用户失败：{error}"))?;
+            item.likes = likes.filter_map(Result::ok).collect();
+        }
+        items
+    };
+
+    let (hits, global_total) =
+        search_global_documents(&connection, owner_uin, keyword, limit, offset)?;
+    Ok(SearchResult {
+        items,
+        hits,
+        total: global_total,
+    })
+}
+
+fn search_global_documents(
+    connection: &Connection,
+    owner_uin: &str,
+    keyword: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<(Vec<SearchHit>, u32), String> {
+    let matcher = keyword
+        .split_whitespace()
+        .filter(|token| token.chars().any(|character| character.is_alphanumeric()))
+        .map(|token| format!("\"{}\"*", token.replace('"', "")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let use_fts = !matcher.is_empty() && keyword.is_ascii();
+    let limit = limit.clamp(1, 100);
+
+    let (total, rows) = if use_fts {
+        let total: u32 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM archive_global_search s
+                 WHERE archive_global_search MATCH ?1 AND s.owner_uin=?2",
+                params![matcher, owner_uin],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("全局搜索计数失败：{error}"))?;
+        let mut statement = connection
+            .prepare(
+                "SELECT d.kind,d.ref_id,d.cell_id,d.title,d.body,d.author_name,d.created_at
+                 FROM archive_global_search s
+                 JOIN archive_search_documents d ON d.id=s.rowid
+                 WHERE archive_global_search MATCH ?1 AND s.owner_uin=?2
+                 ORDER BY rank,d.created_at DESC LIMIT ?3 OFFSET ?4",
+            )
+            .map_err(|error| format!("准备全局搜索失败：{error}"))?;
+        let rows = statement
+            .query_map(
+                params![matcher, owner_uin, limit, offset],
+                search_hit_from_row,
+            )
+            .map_err(|error| format!("执行全局搜索失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("读取全局搜索结果失败：{error}"))?;
+        (total, rows)
+    } else {
+        let like = format!("%{keyword}%");
+        let total: u32 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM archive_search_documents
+                 WHERE owner_uin=?1 AND (COALESCE(title,'') LIKE ?2 OR COALESCE(body,'') LIKE ?2 OR COALESCE(author_name,'') LIKE ?2)",
+                params![owner_uin, like],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("全局搜索计数失败：{error}"))?;
+        let mut statement = connection
+            .prepare(
+                "SELECT kind,ref_id,cell_id,title,body,author_name,created_at
+                 FROM archive_search_documents
+                 WHERE owner_uin=?1 AND (COALESCE(title,'') LIKE ?2 OR COALESCE(body,'') LIKE ?2 OR COALESCE(author_name,'') LIKE ?2)
+                 ORDER BY created_at DESC LIMIT ?3 OFFSET ?4",
+            )
+            .map_err(|error| format!("准备全局搜索失败：{error}"))?;
+        let rows = statement
+            .query_map(params![owner_uin, like, limit, offset], search_hit_from_row)
+            .map_err(|error| format!("执行全局搜索失败：{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("读取全局搜索结果失败：{error}"))?;
+        (total, rows)
+    };
+    Ok((rows, total))
+}
+
+fn search_hit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchHit> {
+    let title: Option<String> = row.get(3)?;
+    let body: Option<String> = row.get(4)?;
+    let snippet = body.clone().or(title.clone()).unwrap_or_default();
+    let snippet = snippet.chars().take(160).collect();
+    Ok(SearchHit {
+        kind: row.get(0)?,
+        ref_id: row.get(1)?,
+        cell_id: row.get(2)?,
+        title,
+        snippet,
+        author_name: row.get(5)?,
+        created_at: row.get(6)?,
+    })
+}
+
 /// 那年今日：查询历史上今天（相同月日，但不同年份）的动态记录
 #[tauri::command]
 pub async fn list_on_this_day_feeds(
@@ -2766,14 +3283,29 @@ pub(crate) fn archive_items_for_export(
     category: &str,
     selected_ids: Option<&HashSet<i64>>,
 ) -> Result<Vec<ArchiveItem>, String> {
+    archive_items_for_export_since(connection, owner_uin, category, selected_ids, None)
+}
+
+pub(crate) fn archive_items_for_export_since(
+    connection: &Connection,
+    owner_uin: &str,
+    category: &str,
+    selected_ids: Option<&HashSet<i64>>,
+    since: Option<i64>,
+) -> Result<Vec<ArchiveItem>, String> {
     let mut statement = connection.prepare(
         "SELECT d.id,d.owner_uin,d.cell_id,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
           (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type=217),
           (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type IN (2,311))
-         FROM archive_dynamics d WHERE d.owner_uin=?1 AND d.category=?2 ORDER BY d.published_at ASC"
+         FROM archive_dynamics d WHERE d.owner_uin=?1 AND d.category=?2
+           AND (?3 IS NULL OR d.archived_at >= ?3 OR EXISTS (
+               SELECT 1 FROM archive_feeds f
+               WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_time >= ?3
+           ))
+         ORDER BY d.published_at ASC"
     ).map_err(|error| format!("准备导出查询失败：{error}"))?;
     let rows = statement
-        .query_map(params![owner_uin, category], |row| {
+        .query_map(params![owner_uin, category, since], |row| {
             let video_json = row.get::<_, Option<String>>(8)?;
             let video_urls = video_urls(video_json.clone());
             Ok(ArchiveItem {

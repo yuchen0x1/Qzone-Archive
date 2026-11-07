@@ -107,5 +107,26 @@ export const resetFailedAlbumPhotos = (albumId: string) => invoke<number>("reset
 export const deleteArchivedAlbum = (albumId: string) => invoke<number>("delete_archived_album", { albumId });
 export const loadAlbumPhoto = (photoId: number) => invoke<string>("load_album_photo", { photoId });
 export interface ExportPackageStats { targetPath: string; dynamicCount: number; htmlFiles: number; mediaFiles: number; albumCount: number; totalBytes: number; }
-export const exportArchivePackage = (targetPath: string, categories: ArchiveCategory[], includeAlbums: boolean, includeMedia: boolean) =>
-  invoke<ExportPackageStats>("export_archive_package", { targetPath, categories, includeAlbums, includeMedia });
+export type ExportStatus = "idle" | "running" | "completed" | "cancelled" | "error";
+export interface ExportProgress { status: ExportStatus; current: number; total: number; message: string; }
+export const exportArchivePackage = (targetPath: string, categories: ArchiveCategory[], includeAlbums: boolean, includeMedia: boolean, incremental = false) =>
+  invoke<ExportPackageStats>("export_archive_package", { targetPath, categories, includeAlbums, includeMedia, incremental });
+export const getExportProgress = () => invoke<ExportProgress>("get_export_progress");
+export const cancelExport = () => invoke<void>("cancel_export");
+
+export interface BackupStats { targetPath: string; databaseBytes: number; imageCount: number; imageBytes: number; totalBytes: number; }
+export const backupAppData = (targetPath: string) => invoke<BackupStats>("backup_app_data", { targetPath });
+export const restoreAppData = (backupPath: string) => invoke<BackupStats>("restore_app_data", { backupPath });
+
+export type SearchHitKind = "dynamic" | "comment" | "album" | "photo" | "contact";
+export interface SearchHit {
+  kind: SearchHitKind;
+  refId: number;
+  cellId?: string;
+  title?: string;
+  snippet: string;
+  authorName?: string;
+  createdAt: number;
+}
+export interface SearchResult { items: ArchiveItem[]; hits: SearchHit[]; total: number; }
+export const globalSearch = (keyword: string, limit = 20, offset = 0) => invoke<SearchResult>("global_search", { keyword, limit, offset });

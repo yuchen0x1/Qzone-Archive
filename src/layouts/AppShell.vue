@@ -7,11 +7,14 @@ import Button from "primevue/button";
 import Dialog from "primevue/dialog";
 import Drawer from "primevue/drawer";
 import Popover from "primevue/popover";
+import InputText from "primevue/inputtext";
 import LoginDialog from "../components/LoginDialog.vue";
 import sidebarToggleIcon from "../assets/sidebar-toggle.png";
 import { useAppStore } from "../stores/app";
 import { useAuthStore } from "../stores/auth";
 import { assetForPlatform, checkForUpdate, updateAssetLabel, type UpdateInfo, type UpdatePlatform } from "../utils/updater";
+import { getAutoUpdate } from "../utils/appSettings";
+import { globalSearch, type SearchHit, type SearchResult } from "../utils/qzone";
 
 defineProps<{ pageTitle: string }>();
 const appStore = useAppStore();
@@ -23,6 +26,60 @@ const moreVisible = ref(false);
 const logoutLoading = ref(false);
 const { darkMode, privacyMode, sidebarCollapsed, themeIcon, privacyIcon } = storeToRefs(appStore);
 const { loggedIn, user } = storeToRefs(authStore);
+const searchPopover = ref<InstanceType<typeof Popover>>();
+const searchKeyword = ref("");
+const searchResults = ref<SearchResult>({ items: [], hits: [], total: 0 });
+const searchLoading = ref(false);
+const searchTimer = ref<ReturnType<typeof setTimeout>>();
+let searchSeq = 0;
+async function runSearch() {
+  const keyword = searchKeyword.value.trim();
+  if (!keyword) { searchResults.value = { items: [], hits: [], total: 0 }; return; }
+  const seq = ++searchSeq;
+  searchLoading.value = true;
+  try {
+    const result = await globalSearch(keyword, 8, 0);
+    if (seq === searchSeq) searchResults.value = result;
+  } catch { if (seq === searchSeq) searchResults.value = { items: [], hits: [], total: 0 }; }
+  finally { if (seq === searchSeq) searchLoading.value = false; }
+}
+function resetSearch() {
+  if (searchTimer.value) clearTimeout(searchTimer.value);
+  searchSeq += 1;
+  searchKeyword.value = "";
+  searchLoading.value = false;
+  searchResults.value = { items: [], hits: [], total: 0 };
+}
+function onSearchInput() {
+  if (searchTimer.value) clearTimeout(searchTimer.value);
+  searchTimer.value = setTimeout(runSearch, 300);
+}
+function openArchives() {
+  if (searchTimer.value) clearTimeout(searchTimer.value);
+  const keyword = searchKeyword.value.trim();
+  searchPopover.value?.hide();
+  router.push({ path: "/archives", query: keyword ? { q: keyword } : {} });
+}
+function hitKindLabel(kind: SearchHit["kind"]) {
+  return {
+    dynamic: "动态",
+    comment: "评论",
+    album: "相册",
+    photo: "照片",
+    contact: "联系人",
+  }[kind];
+}
+function goToHit(hit: SearchHit) {
+  searchPopover.value?.hide();
+  if (hit.kind === "album" || hit.kind === "photo") {
+    router.push("/albums");
+  } else if (hit.kind === "contact") {
+    router.push("/contacts");
+  } else {
+    const keyword = searchKeyword.value.trim();
+    router.push({ path: "/archives", query: keyword ? { q: keyword } : {} });
+  }
+}
 const showQzoneButton = computed(() => {
   const currentPlatform = platform();
   return currentPlatform !== "android" && currentPlatform !== "ios";
@@ -68,7 +125,8 @@ const startupUpdate = ref<UpdateInfo | null>(null);
 const startupUpdateVisible = ref(false);
 
 onMounted(async () => {
-  // 启动时静默检查一次更新，仅在发现新版本时弹窗提示（失败不打扰用户）。
+  // 仅当用户在设置中开启"自动检查更新"时，启动才静默检查一次（失败不打扰用户）。
+  if (!getAutoUpdate()) return;
   try {
     startupUpdate.value = await checkForUpdate();
     if (startupUpdate.value) startupUpdateVisible.value = true;
@@ -133,6 +191,22 @@ async function logout() {
       <header class="topbar">
         <div><p class="topbar-eyebrow">QZONE ARCHIVE</p><h1>{{ pageTitle }}</h1></div>
         <div class="topbar-actions">
+          <Button icon="pi pi-search" severity="secondary" text rounded aria-label="全局搜索" @click="searchPopover?.toggle($event)" />
+          <Popover ref="searchPopover" class="search-popover" @show="resetSearch">
+            <div class="search-popover-input"><i class="pi pi-search" /><InputText v-model="searchKeyword" placeholder="搜索全部归档内容…" @input="onSearchInput" @keyup.enter="openArchives" /></div>
+            <div v-if="searchLoading" class="search-popover-hint"><i class="pi pi-spinner pi-spin" />搜索中…</div>
+            <div v-else-if="searchResults.hits.length" class="search-popover-results">
+              <button v-for="hit in searchResults.hits" :key="`${hit.kind}-${hit.refId}`" type="button" class="search-popover-item" @click="goToHit(hit)">
+                <span class="search-popover-avatar"><i :class="hit.kind === 'contact' ? 'pi pi-user' : hit.kind === 'album' || hit.kind === 'photo' ? 'pi pi-image' : 'pi pi-file-edit'" /></span>
+                <span class="search-popover-copy"><strong>{{ hit.title || hit.authorName || hitKindLabel(hit.kind) }} <small>{{ hitKindLabel(hit.kind) }}</small></strong><small>{{ hit.snippet || "（无内容）" }}</small></span>
+                <i class="pi pi-angle-right" />
+              </button>
+              <div v-if="searchResults.total > searchResults.hits.length" class="search-popover-more">
+                <small>{{ searchResults.total }} 条结果 · </small><Button label="查看全部" text size="small" @click="openArchives" />
+              </div>
+            </div>
+            <div v-else-if="searchKeyword.trim()" class="search-popover-hint"><i class="pi pi-info-circle" />无匹配结果，按回车查看归档页搜索</div>
+          </Popover>
           <Button
             :icon="privacyIcon"
             :severity="privacyMode ? 'primary' : 'secondary'"

@@ -8,6 +8,7 @@
     "core:webview:allow-create-webview-window",
     "opener:default",
     "dialog:allow-save",
+    "dialog:allow-open",
     "fs:allow-write-file",
     {
       "identifier": "http:default",

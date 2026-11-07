@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { useRoute } from "vue-router";
 import { platform } from "@tauri-apps/plugin-os";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -8,15 +9,17 @@ import Button from "primevue/button";
 import Checkbox from "primevue/checkbox";
 import Dialog from "primevue/dialog";
 import InputText from "primevue/inputtext";
+import ProgressBar from "primevue/progressbar";
 import Paginator, { type PageState } from "primevue/paginator";
 import QzoneText from "../components/QzoneText.vue";
 import { loadRemoteImageBlob } from "../utils/archiveImage";
 import { useAuthStore } from "../stores/auth";
-import { clearArchivedFeeds, countArchivedFeeds, deleteArchivedFeeds, exportArchivePackage, exportArchivedHtml, exportArchivedJson, exportArchivedMarkdown, listArchivedFeeds, loadArchivedImage, loadArchivedVideo, syncGuestbookPage, type ArchiveCategory, type ArchiveItem, type ExportPackageStats } from "../utils/qzone";
+import { cancelExport, clearArchivedFeeds, countArchivedFeeds, deleteArchivedFeeds, exportArchivePackage, exportArchivedHtml, exportArchivedJson, exportArchivedMarkdown, getExportProgress, listArchivedFeeds, loadArchivedImage, loadArchivedVideo, syncGuestbookPage, type ArchiveCategory, type ArchiveItem, type ExportPackageStats, type ExportProgress } from "../utils/qzone";
 import { getArchiveInterval } from "../utils/appSettings";
 
 type DeleteAction = "selected" | "all";
 const authStore = useAuthStore();
+const route = useRoute();
 const records = ref<ArchiveItem[]>([]);
 const query = ref("");
 const loading = ref(false);
@@ -228,8 +231,11 @@ async function exportHtml(selectedOnly: boolean) {
 const packageVisible = ref(false);
 const pkgIncludeAlbums = ref(true);
 const pkgIncludeMedia = ref(true);
+const pkgIncremental = ref(false);
 const pkgExporting = ref(false);
 const pkgResult = ref<ExportPackageStats>();
+const pkgProgress = ref<ExportProgress>({ status: "idle", current: 0, total: 0, message: "尚未开始导出" });
+let pkgProgressTimer: ReturnType<typeof setInterval> | undefined;
 const pkgCategories = ref<ArchiveCategory[]>(["self", "other", "guestbook"]);
 const pkgCategoryOptions: { label: string; value: ArchiveCategory }[] = [
   { label: "本人动态", value: "self" },
@@ -239,7 +245,32 @@ const pkgCategoryOptions: { label: string; value: ArchiveCategory }[] = [
 function formatPackageSize(bytes: number) {
   return bytes >= 1024 * 1024 * 1024 ? `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB` : bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
-function openPackageDialog() { pkgResult.value = undefined; packageVisible.value = true; }
+const pkgProgressPercent = computed(() => pkgProgress.value.total > 0
+  ? Math.min(100, (pkgProgress.value.current / pkgProgress.value.total) * 100)
+  : 0);
+async function refreshPackageProgress() {
+  try { pkgProgress.value = await getExportProgress(); } catch { /* 导出状态查询失败不影响导出本身 */ }
+}
+function startPackageProgressPolling() {
+  if (pkgProgressTimer) return;
+  pkgProgressTimer = setInterval(() => { void refreshPackageProgress(); }, 500);
+}
+function stopPackageProgressPolling() {
+  if (pkgProgressTimer) window.clearInterval(pkgProgressTimer);
+  pkgProgressTimer = undefined;
+}
+function openPackageDialog() {
+  pkgResult.value = undefined;
+  pkgProgress.value = { status: "idle", current: 0, total: 0, message: "尚未开始导出" };
+  packageVisible.value = true;
+}
+async function cancelPackageExport() {
+  if (!pkgExporting.value) return;
+  try {
+    await cancelExport();
+    pkgProgress.value = { ...pkgProgress.value, message: "正在取消导出…" };
+  } catch (reason) { error.value = `取消导出失败：${String(reason)}`; }
+}
 
 const gbSyncing = ref(false);
 const gbMessage = ref("");
@@ -299,6 +330,7 @@ async function exportSingleFile(kind: "json" | "md") {
 async function exportPackage() {
   if (pkgExporting.value || !pkgCategories.value.length) return;
   pkgExporting.value = true; error.value = "";
+  startPackageProgressPolling();
   try {
     const date = new Date().toISOString().slice(0, 10);
     const path = await save({
@@ -306,9 +338,15 @@ async function exportPackage() {
       filters: [{ name: "ZIP 压缩包", extensions: ["zip"] }],
     });
     if (!path) return;
-    pkgResult.value = await exportArchivePackage(path, pkgCategories.value, pkgIncludeAlbums.value, pkgIncludeMedia.value);
-  } catch (reason) { error.value = `导出离线包失败：${String(reason)}`; packageVisible.value = false; }
-  finally { pkgExporting.value = false; }
+    pkgResult.value = await exportArchivePackage(path, pkgCategories.value, pkgIncludeAlbums.value, pkgIncludeMedia.value, pkgIncremental.value);
+    await refreshPackageProgress();
+  } catch (reason) {
+    if (String(reason) !== "EXPORT_CANCELLED") error.value = `导出离线包失败：${String(reason)}`;
+  } finally {
+    pkgExporting.value = false;
+    stopPackageProgressPolling();
+    await refreshPackageProgress();
+  }
 }
 async function loadVideo(item: ArchiveItem) {
   if (!item.videoUrl || videoLoading[item.id]) return;
@@ -353,9 +391,16 @@ async function confirmDelete() {
   } catch (reason) { error.value = String(reason); }
   finally { deleting.value = false; }
 }
-onMounted(async () => { if (authStore.loggedIn) await load(); });
+onMounted(async () => {
+  const routeQuery = route.query.q;
+  query.value = typeof routeQuery === "string" ? routeQuery : "";
+  if (authStore.loggedIn) await load();
+});
 watch(category, () => { first.value = 0; query.value = ""; void load(); });
-onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVideos(); });
+watch(() => route.query.q, (value) => {
+  query.value = typeof value === "string" ? value : "";
+});
+onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVideos(); stopPackageProgressPolling(); });
 </script>
 
 <template>
@@ -460,6 +505,7 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
         <legend>离线包 · 包含内容</legend>
         <label class="package-check"><Checkbox v-model="pkgIncludeAlbums" binary :input-id="`pkg-albums`" />相册照片（已备份的相册）</label>
         <label class="package-check"><Checkbox v-model="pkgIncludeMedia" binary :input-id="`pkg-media`" />把本地已缓存的图片/视频打包进文件（关闭则保留外链）</label>
+        <label class="package-check"><Checkbox v-model="pkgIncremental" binary :input-id="`pkg-incremental`" />仅导出该文件上次成功导出后的变更</label>
       </fieldset>
       <fieldset class="package-fieldset">
         <legend>单文件格式（当前分类{{ selectedIds.length ? ` · 已选 ${selectedIds.length} 条` : "" }}）</legend>
@@ -469,7 +515,12 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
         </div>
         <small class="package-hint">含评论、回复与点赞名单；JSON 为结构化原始数据，Markdown 适合打印与阅读。</small>
       </fieldset>
+      <p v-if="pkgIncremental" class="package-hint"><i class="pi pi-info-circle" />增量基准按导出文件路径保存；首次对该路径导出时会生成完整离线包。</p>
       <p v-if="!pkgCategories.length" class="package-warn"><i class="pi pi-exclamation-triangle" />离线包需要至少选择一个动态分类。</p>
+      <div v-if="pkgExporting || pkgProgress.status === 'cancelled' || pkgProgress.status === 'error'" class="package-progress">
+        <div class="package-progress-heading"><strong>{{ pkgProgress.message }}</strong><span v-if="pkgProgress.total">{{ pkgProgress.current }} / {{ pkgProgress.total }}</span></div>
+        <ProgressBar :value="pkgProgressPercent" :mode="pkgProgress.total ? 'determinate' : 'indeterminate'" :show-value="false" style="height: 7px" />
+      </div>
       <div v-if="pkgResult" class="package-result">
         <p><i class="pi pi-check-circle" />导出完成：<strong>{{ pkgResult.targetPath }}</strong></p>
         <small>动态 {{ pkgResult.dynamicCount }} 条 · 相册 {{ pkgResult.albumCount }} 个 · HTML {{ pkgResult.htmlFiles }} 个 · 媒体文件 {{ pkgResult.mediaFiles }} 个 · 总大小 {{ formatPackageSize(pkgResult.totalBytes) }}</small>
@@ -477,7 +528,8 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
     </div>
     <template #footer>
       <Button label="关闭" severity="secondary" text :disabled="pkgExporting" @click="packageVisible = false" />
-      <Button label="选择位置并导出离线包" icon="pi pi-box" :loading="pkgExporting" :disabled="!pkgCategories.length" @click="exportPackage" />
+      <Button v-if="pkgExporting" label="取消导出" icon="pi pi-stop" severity="warn" outlined @click="cancelPackageExport" />
+      <Button v-else label="选择位置并导出离线包" icon="pi pi-box" :disabled="!pkgCategories.length" @click="exportPackage" />
     </template>
   </Dialog>
   <Teleport to="body">

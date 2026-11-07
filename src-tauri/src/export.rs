@@ -1,11 +1,15 @@
 use std::{
     cell::Cell,
     fs,
-    path::Path,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use serde_json::json;
 use tauri::Manager;
@@ -13,7 +17,7 @@ use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 use crate::{
     archive::{
-        archive_items_for_export, archived_image_dir, existing_archived_image, feed_document,
+        archive_items_for_export_since, archived_image_dir, existing_archived_image, feed_document,
         html_escape, open_database, validate_category, video_cache_path, ArchiveItem,
         ExportMediaResolver, EXPORT_CSS,
     },
@@ -26,7 +30,72 @@ const CATEGORIES: [(&str, &str); 3] = [
     ("guestbook", "留言"),
 ];
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportProgress {
+    status: &'static str,
+    current: u64,
+    total: u64,
+    message: String,
+}
+
+impl Default for ExportProgress {
+    fn default() -> Self {
+        Self {
+            status: "idle",
+            current: 0,
+            total: 0,
+            message: "尚未开始导出".into(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ExportState {
+    progress: Arc<Mutex<ExportProgress>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Default for ExportState {
+    fn default() -> Self {
+        Self {
+            progress: Arc::new(Mutex::new(ExportProgress::default())),
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl ExportState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn set_progress(&self, update: impl FnOnce(&mut ExportProgress)) {
+        if let Ok(mut progress) = self.progress.lock() {
+            update(&mut progress);
+        }
+    }
+
+    fn snapshot(&self) -> Result<ExportProgress, String> {
+        self.progress
+            .lock()
+            .map(|progress| progress.clone())
+            .map_err(|_| "导出状态锁已损坏".into())
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+}
+
+fn advance_progress(state: &ExportState, amount: u64, message: impl Into<String>) {
+    state.set_progress(|progress| {
+        progress.current = progress.current.saturating_add(amount).min(progress.total);
+        progress.message = message.into();
+    });
+}
+
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportPackageStats {
     target_path: String,
@@ -43,10 +112,12 @@ pub struct ExportPackageStats {
 pub async fn export_archive_package(
     app: tauri::AppHandle,
     login: tauri::State<'_, QLoginState>,
+    state: tauri::State<'_, ExportState>,
     target_path: String,
     categories: Option<Vec<String>>,
     include_albums: Option<bool>,
     include_media: Option<bool>,
+    incremental: Option<bool>,
 ) -> Result<ExportPackageStats, String> {
     let owner_uin = login.qzone_auth().await?.uin;
     let categories = categories.unwrap_or_default();
@@ -67,8 +138,25 @@ pub async fn export_archive_package(
     if target_path.trim().is_empty() {
         return Err("请先选择导出位置".into());
     }
+    {
+        let progress = state.snapshot()?;
+        if progress.status == "running" {
+            return Err("已有导出任务正在运行".into());
+        }
+    }
+    state.cancel.store(false, Ordering::Relaxed);
+    state.set_progress(|progress| {
+        *progress = ExportProgress {
+            status: "running",
+            current: 0,
+            total: 0,
+            message: "正在准备导出…".into(),
+        };
+    });
+    let state = state.inner().clone();
     let include_albums = include_albums.unwrap_or(true);
     let include_media = include_media.unwrap_or(true);
+    let incremental = incremental.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
         build_package(
             &app,
@@ -77,12 +165,15 @@ pub async fn export_archive_package(
             &wanted,
             include_albums,
             include_media,
+            incremental,
+            &state,
         )
     })
     .await
     .map_err(|error| format!("导出任务异常退出：{error}"))?
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_package(
     app: &tauri::AppHandle,
     owner_uin: &str,
@@ -90,6 +181,8 @@ fn build_package(
     wanted: &[String],
     include_albums: bool,
     include_media: bool,
+    incremental: bool,
+    state: &ExportState,
 ) -> Result<ExportPackageStats, String> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -101,18 +194,42 @@ fn build_package(
         .map_err(|error| format!("无法获取缓存目录：{error}"))?
         .join(format!("export-{nonce}"));
     let media_dir = staging.join("media");
-    fs::create_dir_all(&media_dir).map_err(|error| format!("无法创建导出目录：{error}"))?;
-    let outcome = build_package_contents(
-        app,
-        owner_uin,
-        &staging,
-        &media_dir,
-        target_path,
-        wanted,
-        include_albums,
-        include_media,
-    );
+    let outcome = (|| {
+        fs::create_dir_all(&media_dir).map_err(|error| format!("无法创建导出目录：{error}"))?;
+        let export_started_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        build_package_contents(
+            app,
+            owner_uin,
+            &staging,
+            &media_dir,
+            target_path,
+            wanted,
+            include_albums,
+            include_media,
+            incremental,
+            export_started_at,
+            state,
+        )
+    })();
     let _ = fs::remove_dir_all(&staging);
+    match &outcome {
+        Ok(stats) => state.set_progress(|progress| {
+            progress.status = "completed";
+            progress.current = progress.total;
+            progress.message = format!("导出完成，共生成 {} 个 HTML 文件", stats.html_files);
+        }),
+        Err(error) if error == "EXPORT_CANCELLED" => state.set_progress(|progress| {
+            progress.status = "cancelled";
+            progress.message = "导出已取消".into();
+        }),
+        Err(error) => state.set_progress(|progress| {
+            progress.status = "error";
+            progress.message = format!("导出失败：{error}");
+        }),
+    }
     outcome
 }
 
@@ -126,20 +243,87 @@ fn build_package_contents(
     wanted: &[String],
     include_albums: bool,
     include_media: bool,
+    incremental: bool,
+    export_started_at: i64,
+    state: &ExportState,
 ) -> Result<ExportPackageStats, String> {
     let connection = open_database(app)?;
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS archive_export_state (
+                owner_uin TEXT NOT NULL,
+                target_path TEXT NOT NULL,
+                last_export_at INTEGER NOT NULL,
+                PRIMARY KEY(owner_uin, target_path)
+            )",
+        )
+        .map_err(|error| format!("初始化增量导出记录失败：{error}"))?;
+    let since = if incremental {
+        connection
+            .query_row(
+                "SELECT last_export_at FROM archive_export_state WHERE owner_uin=?1 AND target_path=?2",
+                params![owner_uin, target_path],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("读取增量导出记录失败：{error}"))?
+    } else {
+        None
+    };
     let images_dir = archived_image_dir(app, owner_uin)?;
     let media_files = Cell::new(0u64);
     let mut dynamic_count = 0u64;
     let mut html_files = 0u32;
     let mut nav_entries: Vec<(String, String, u64)> = Vec::new();
     let mut all_items: Vec<ArchiveItem> = Vec::new();
+    let mut total_items = 0u64;
+    for (category_id, _) in CATEGORIES
+        .iter()
+        .filter(|(id, _)| wanted.iter().any(|value| value == id))
+    {
+        total_items +=
+            archive_items_for_export_since(&connection, owner_uin, category_id, None, since)?.len()
+                as u64;
+    }
+    let album_total: u64 = if include_albums {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM archive_album_photos p
+                 JOIN archive_albums a ON a.owner_uin=p.owner_uin AND a.album_id=p.album_id
+                 WHERE p.owner_uin=?1 AND (?2 IS NULL OR a.updated_at >= ?2 OR EXISTS (
+                     SELECT 1 FROM archive_album_photos p2
+                     WHERE p2.owner_uin=a.owner_uin AND p2.album_id=a.album_id AND p2.updated_at >= ?2
+                 ))",
+                params![owner_uin, since],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count.max(0) as u64)
+            .map_err(|error| format!("统计相册导出数量失败：{error}"))?
+    } else {
+        0
+    };
+    let total_work = total_items.saturating_add(album_total).max(1);
+    state.set_progress(|progress| {
+        progress.total = total_work;
+        progress.message = if incremental && since.is_some() {
+            format!("正在准备增量导出，共 {total_work} 项变更…")
+        } else {
+            format!("正在准备导出，共 {total_work} 项内容…")
+        };
+    });
+    if state.is_cancelled() {
+        return Err("EXPORT_CANCELLED".into());
+    }
 
     for (category_id, category_name) in CATEGORIES
         .iter()
         .filter(|(id, _)| wanted.iter().any(|value| value == id))
     {
-        let items = archive_items_for_export(&connection, owner_uin, category_id, None)?;
+        if state.is_cancelled() {
+            return Err("EXPORT_CANCELLED".into());
+        }
+        let items =
+            archive_items_for_export_since(&connection, owner_uin, category_id, None, since)?;
         if items.is_empty() {
             continue;
         }
@@ -185,6 +369,11 @@ fn build_package_contents(
         fs::write(staging.join(&file_name), page)
             .map_err(|error| format!("写入分类导出页失败：{error}"))?;
         html_files += 1;
+        advance_progress(
+            state,
+            items.len() as u64,
+            format!("正在生成{}页面（{}条）…", category_name, items.len()),
+        );
         nav_entries.push((file_name, (*category_name).to_owned(), items.len() as u64));
         all_items.extend(items);
     }
@@ -193,7 +382,15 @@ fn build_package_contents(
     let mut album_index: Vec<(String, String, u64)> = Vec::new();
     let mut album_records: Vec<serde_json::Value> = Vec::new();
     if include_albums {
-        let albums = export_albums(owner_uin, &connection, staging, include_media, &media_files)?;
+        let albums = export_albums(
+            owner_uin,
+            &connection,
+            staging,
+            include_media,
+            &media_files,
+            since,
+            state,
+        )?;
         album_count = albums.len() as u32;
         for (dir_name, album_name, photo_count, record) in albums {
             album_index.push((
@@ -291,7 +488,21 @@ fn build_package_contents(
     )
     .map_err(|error| format!("写入结构化数据失败：{error}"))?;
 
-    let total_bytes = zip_directory(staging, target_path)?;
+    if state.is_cancelled() {
+        return Err("EXPORT_CANCELLED".into());
+    }
+    state.set_progress(|progress| {
+        progress.message = "正在压缩离线包…".into();
+    });
+    let total_bytes = zip_directory(staging, target_path, state)?;
+    connection
+        .execute(
+            "INSERT INTO archive_export_state(owner_uin,target_path,last_export_at)
+             VALUES (?1,?2,?3)
+             ON CONFLICT(owner_uin,target_path) DO UPDATE SET last_export_at=excluded.last_export_at",
+            params![owner_uin, target_path, export_started_at],
+        )
+        .map_err(|error| format!("保存增量导出记录失败：{error}"))?;
     Ok(ExportPackageStats {
         target_path: target_path.to_owned(),
         dynamic_count,
@@ -311,6 +522,8 @@ fn export_albums(
     staging: &Path,
     include_media: bool,
     media_files: &Cell<u64>,
+    since: Option<i64>,
+    state: &ExportState,
 ) -> Result<Vec<ExportedAlbum>, String> {
     let mut statement = connection
         .prepare(
@@ -321,6 +534,10 @@ fn export_albums(
              LEFT JOIN archive_album_photos p
                ON p.owner_uin=a.owner_uin AND p.album_id=a.album_id
              WHERE a.owner_uin=?1
+               AND (?2 IS NULL OR a.updated_at >= ?2 OR EXISTS (
+                   SELECT 1 FROM archive_album_photos p2
+                   WHERE p2.owner_uin=a.owner_uin AND p2.album_id=a.album_id AND p2.updated_at >= ?2
+               ))
              ORDER BY a.modify_time IS NULL, a.modify_time DESC,
                       p.upload_time IS NULL, p.upload_time ASC, p.id ASC",
         )
@@ -344,7 +561,7 @@ fn export_albums(
     }
     let mut albums: Vec<AlbumRow> = Vec::new();
     let rows = statement
-        .query_map(params![owner_uin], |row| {
+        .query_map(params![owner_uin, since], |row| {
             let urls_json: String = row.get::<_, Option<String>>(10)?.unwrap_or_default();
             Ok((
                 row.get::<_, String>(0)?,
@@ -421,6 +638,9 @@ fn export_albums(
         let mut photo_records: Vec<serde_json::Value> = Vec::new();
         let mut copied_count = 0u64;
         for photo in &album.photos {
+            if state.is_cancelled() {
+                return Err("EXPORT_CANCELLED".into());
+            }
             let stem = crate::albums::safe_file_stem(&photo.pic_key);
             let mut relative_src: Option<String> = None;
             if include_media {
@@ -472,6 +692,11 @@ fn export_albums(
         );
         fs::write(album_dir.join("index.html"), page)
             .map_err(|error| format!("写入相册导出页失败：{error}"))?;
+        advance_progress(
+            state,
+            album.photos.len() as u64,
+            format!("正在生成相册「{}」…", album.name),
+        );
         exported.push((
             dir_name,
             album.name.clone(),
@@ -506,38 +731,84 @@ fn file_extension(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
-fn zip_directory(source: &Path, target: &str) -> Result<u64, String> {
+fn zip_directory(source: &Path, target: &str, state: &ExportState) -> Result<u64, String> {
     use std::io::Write as _;
-    let file = fs::File::create(target).map_err(|error| format!("无法创建导出文件：{error}"))?;
-    let mut zip = ZipWriter::new(file);
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-    let mut stack = vec![source.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries = fs::read_dir(&dir).map_err(|error| format!("读取导出目录失败：{error}"))?;
-        for entry in entries {
-            let entry = entry.map_err(|error| format!("读取导出目录失败：{error}"))?;
-            let path = entry.path();
-            let relative = path
-                .strip_prefix(source)
-                .map_err(|error| format!("计算导出相对路径失败：{error}"))?;
-            let name = relative.to_string_lossy().replace('\\', "/");
-            if path.is_dir() {
-                stack.push(path);
-                zip.add_directory(&name, options)
-                    .map_err(|error| format!("写入 zip 目录失败：{error}"))?;
-            } else {
-                zip.start_file(&name, options)
-                    .map_err(|error| format!("写入 zip 失败：{error}"))?;
-                let bytes =
-                    fs::read(&path).map_err(|error| format!("读取待打包文件失败：{error}"))?;
-                zip.write_all(&bytes)
-                    .map_err(|error| format!("写入 zip 数据失败：{error}"))?;
+    let partial = PathBuf::from(format!("{target}.part"));
+    let _ = fs::remove_file(&partial);
+    let result = (|| {
+        let file =
+            fs::File::create(&partial).map_err(|error| format!("无法创建导出文件：{error}"))?;
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        let mut stack = vec![source.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let entries =
+                fs::read_dir(&dir).map_err(|error| format!("读取导出目录失败：{error}"))?;
+            for entry in entries {
+                if state.is_cancelled() {
+                    return Err("EXPORT_CANCELLED".into());
+                }
+                let entry = entry.map_err(|error| format!("读取导出目录失败：{error}"))?;
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(source)
+                    .map_err(|error| format!("计算导出相对路径失败：{error}"))?;
+                let name = relative.to_string_lossy().replace('\\', "/");
+                if path.is_dir() {
+                    stack.push(path);
+                    zip.add_directory(&name, options)
+                        .map_err(|error| format!("写入 zip 目录失败：{error}"))?;
+                } else {
+                    zip.start_file(&name, options)
+                        .map_err(|error| format!("写入 zip 失败：{error}"))?;
+                    let bytes =
+                        fs::read(&path).map_err(|error| format!("读取待打包文件失败：{error}"))?;
+                    zip.write_all(&bytes)
+                        .map_err(|error| format!("写入 zip 数据失败：{error}"))?;
+                }
             }
         }
+        zip.finish()
+            .map_err(|error| format!("完成 zip 打包失败：{error}"))?;
+        fs::metadata(&partial)
+            .map(|metadata| metadata.len())
+            .map_err(|error| format!("读取导出文件大小失败：{error}"))
+    })();
+    match result {
+        Ok(total_bytes) => {
+            if state.is_cancelled() {
+                let _ = fs::remove_file(&partial);
+                return Err("EXPORT_CANCELLED".into());
+            }
+            let target_path = Path::new(target);
+            let backup = PathBuf::from(format!("{target}.previous"));
+            let _ = fs::remove_file(&backup);
+            if target_path.exists() {
+                fs::rename(target_path, &backup)
+                    .map_err(|error| format!("暂存旧导出文件失败：{error}"))?;
+            }
+            if let Err(error) = fs::rename(&partial, target_path) {
+                if backup.exists() {
+                    let _ = fs::rename(&backup, target_path);
+                }
+                return Err(format!("保存导出文件失败：{error}"));
+            }
+            let _ = fs::remove_file(&backup);
+            Ok(total_bytes)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&partial);
+            Err(error)
+        }
     }
-    zip.finish()
-        .map_err(|error| format!("完成 zip 打包失败：{error}"))?;
-    fs::metadata(target)
-        .map(|metadata| metadata.len())
-        .map_err(|error| format!("读取导出文件大小失败：{error}"))
+}
+
+#[tauri::command]
+pub fn get_export_progress(state: tauri::State<'_, ExportState>) -> Result<ExportProgress, String> {
+    state.snapshot()
+}
+
+#[tauri::command]
+pub fn cancel_export(state: tauri::State<'_, ExportState>) {
+    state.cancel.store(true, Ordering::Relaxed);
 }
