@@ -254,6 +254,12 @@ QQ 视频地址带有时效签名，过期后需要重新归档以更新地址�
 
 详细的贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)，面向协作者的仓库约定见 [AGENTS.md](AGENTS.md)。版本记录见 [Releases](https://github.com/yuchen0x1/Qzone-Archive/releases)。
 
+## Star 历史
+
+[![Star History Chart](https://api.star-history.com/svg?repos=yuchen0x1/Qzone-Archive&type=Date)](https://star-history.com/#yuchen0x1/Qzone-Archive&Date)
+
+如果你的 GitHub 账号方便，欢迎顺手给项目点一个 Star —— 这是让更多需要备份 QQ 空间的人找到它的最直接方式：<https://github.com/yuchen0x1/Qzone-Archive>
+
 ## 许可证
 
 本项目采用 [GPLv3](LICENSE) 许可证。
