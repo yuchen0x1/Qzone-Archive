@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { storeToRefs } from "pinia";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import Button from "primevue/button";
 import ProgressBar from "primevue/progressbar";
 import Tag from "primevue/tag";
@@ -57,13 +58,29 @@ async function refresh() {
   if (!loggedIn.value) { skips.value = []; return; }
   try { skips.value = await listArchiveSkips(); } catch { /* 保留当前列表 */ }
 }
-function beginPolling() { window.clearInterval(timer); timer = window.setInterval(() => { currentTime.value = Date.now(); void refresh(); }, 600); }
+// 归档进度由后端通过 archive-progress 事件推送；这里只在状态切换或异常列表需要刷新时补一次查询。
+let unlistenProgress: UnlistenFn | undefined;
+async function attachProgressEvents() {
+  unlistenProgress = await listen<ArchiveProgress>("archive-progress", (event) => {
+    progress.value = event.payload;
+    if (event.payload.batchRetry) batchRetrying.value = true;
+    const status = event.payload.status;
+    if (status === "completed" || status === "error" || status === "cancelled") {
+      batchRetrying.value = false;
+      batchStopping.value = false;
+      void refreshSkips();
+    }
+  });
+}
+async function refreshSkips() {
+  if (!loggedIn.value) { skips.value = []; return; }
+  try { skips.value = await listArchiveSkips(); } catch { /* 保留当前列表 */ }
+}
 async function start() {
   if (!loggedIn.value) return;
-  beginPolling();
   try { progress.value = await startFeedArchive(getArchiveInterval()); }
   catch { await refresh(); }
-  finally { await refresh(); if (progress.value.status === "limited") beginPolling(); else { window.clearInterval(timer); timer = undefined; } }
+  finally { await refresh(); await refreshSkips(); }
 }
 async function cancel() { await cancelFeedArchive(); await refresh(); }
 async function retrySkip(item: ArchiveSkipItem) {
@@ -96,7 +113,6 @@ async function clearResolved() {
 async function retryAllPending() {
   batchRetrying.value = true;
   skipNotice.value = "";
-  beginPolling();
   try {
     const result = await retryAllArchiveSkips(getArchiveInterval());
     skipNotice.value = batchStopping.value
@@ -112,8 +128,6 @@ async function retryAllPending() {
       batchRetrying.value = false;
       batchStopping.value = false;
     }
-    window.clearInterval(timer);
-    timer = undefined;
   }
 }
 async function stopBatchRetry() {
@@ -167,8 +181,13 @@ async function syncAllShuoshuo() {
   }
 }
 
-onMounted(async () => { await refresh(); currentTime.value = Date.now(); if (running.value || rateLimited.value || batchRetrying.value || batchProgress.value) beginPolling(); });
-onBeforeUnmount(() => window.clearInterval(timer));
+onMounted(async () => {
+  // 倒计时显示需要本地时钟推进，但不需要再查询数据库。
+  timer = window.setInterval(() => { currentTime.value = Date.now(); }, 1000);
+  await attachProgressEvents();
+  await refresh();
+});
+onBeforeUnmount(() => { window.clearInterval(timer); unlistenProgress?.(); });
 </script>
 
 <template>

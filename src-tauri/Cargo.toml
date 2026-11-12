@@ -1,6 +1,6 @@
 [package]
 name = "qzonearchive"
-version = "1.3.3"
+version = "1.3.4"
 description = "将 QQ 空间动态、照片、视频与互动记录安全归档到本地"
 authors = ["Ehre"]
 edition = "2021"
@@ -24,6 +24,7 @@ tauri-plugin-http = { version = "2", features = ["unsafe-headers"] }
 tauri-plugin-os = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
+tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
@@ -37,6 +38,12 @@ url = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 zip = { version = "9", default-features = false, features = ["deflate"] }
 filetime = "0.2.29"
+# 校验 GitHub Release 资产 digest，避免安装包在镜像或传输中被替换。
+sha2 = "0.10"
+
+[target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
+# 官方 Tauri 签名更新器仅在桌面端启用；移动端继续使用发布页手动下载安装包。
+tauri-plugin-updater = "2"
 
 # Backport the upstream VariantStrIter pointer-mutability fix until GTK's
 # dependency chain can move to glib >= 0.20.

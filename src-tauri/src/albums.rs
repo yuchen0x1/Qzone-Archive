@@ -11,6 +11,7 @@ use std::{
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use serde_json::{json, Value};
+use tauri::Emitter;
 
 use crate::{
     archive::{
@@ -53,6 +54,8 @@ impl Default for AlbumProgress {
 pub struct AlbumState {
     progress: Mutex<AlbumProgress>,
     cancel: AtomicBool,
+    /// 进度变化时广播事件用的句柄；None 表示尚未在 setup 中绑定。
+    app: Mutex<Option<tauri::AppHandle>>,
 }
 
 impl AlbumState {
@@ -60,6 +63,13 @@ impl AlbumState {
         Self {
             progress: Mutex::new(AlbumProgress::default()),
             cancel: AtomicBool::new(false),
+            app: Mutex::new(None),
+        }
+    }
+
+    pub fn bind_app(&self, app: tauri::AppHandle) {
+        if let Ok(mut slot) = self.app.lock() {
+            *slot = Some(app);
         }
     }
 }
@@ -123,8 +133,17 @@ fn now() -> i64 {
 }
 
 fn set_album_progress(state: &AlbumState, update: impl FnOnce(&mut AlbumProgress)) {
-    if let Ok(mut progress) = state.progress.lock() {
-        update(&mut progress);
+    let Ok(mut progress) = state.progress.lock() else {
+        return;
+    };
+    update(&mut progress);
+    let snapshot = progress.clone();
+    drop(progress);
+    let Ok(slot) = state.app.lock() else {
+        return;
+    };
+    if let Some(app) = slot.as_ref() {
+        let _ = app.emit("album-progress", snapshot);
     }
 }
 
@@ -1091,6 +1110,36 @@ pub async fn delete_archived_album(
         }
     }
     Ok(removed as u64)
+}
+
+/// 把已归档的相册照片另存到用户选择的位置。
+/// 由后端直接复制本地文件，渲染层无需申请通用文件读取权限，也不依赖 asset 协议。
+#[tauri::command]
+pub async fn save_archived_album_photo(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    photo_id: i64,
+    target_path: String,
+) -> Result<u64, String> {
+    let target = target_path.trim();
+    if target.is_empty() {
+        return Err("请先选择照片保存位置".into());
+    }
+    let owner_uin = login.qzone_auth().await?.uin;
+    let task = {
+        let connection = open_database(&app)?;
+        load_album_photo_task(&connection, &owner_uin, photo_id)?
+    };
+    let image_dir = archived_image_dir(&app, &owner_uin)?
+        .join("albums")
+        .join(safe_file_stem(&task.album_id));
+    let source = existing_archived_image(&image_dir, &safe_file_stem(&task.pic_key))
+        .ok_or("该照片尚未备份到本地，请先打开原图或备份相册")?;
+    fs::copy(&source, target).map_err(|error| format!("保存照片失败：{error}"))?;
+    source
+        .metadata()
+        .map(|metadata| metadata.len())
+        .map_err(|error| format!("读取照片大小失败：{error}"))
 }
 
 /// 按需加载单张相册照片的本地文件（未缓存时自动下载）。

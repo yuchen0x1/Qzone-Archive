@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { useRoute } from "vue-router";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { platform } from "@tauri-apps/plugin-os";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -65,10 +66,7 @@ const currentPlatform = platform();
 const desktopPlatforms = new Set(["windows", "macos", "linux"]);
 const isDesktopPlatform = desktopPlatforms.has(currentPlatform);
 
-const filtered = computed(() => {
-  const key = query.value.trim().toLowerCase();
-  return key ? records.value.filter((item) => [item.content, item.authorName, item.authorUin].some((value) => value?.toLowerCase().includes(key))) : records.value;
-});
+const filtered = computed(() => records.value);
 const visibleIds = computed(() => filtered.value.map((item) => item.id));
 const allVisibleSelected = computed(() => visibleIds.value.length > 0 && visibleIds.value.every((id) => selectedIds.value.includes(id)));
 const confirmTitle = computed(() => pendingAction.value === "all" ? "清空全部归档？" : `删除 ${selectedIds.value.length} 条归档？`);
@@ -79,8 +77,9 @@ const avatarUrl = (uin?: string) => uin ? `https://qlogo2.store.qq.com/qzone/${u
 async function load() {
   releaseVideos();
   loading.value = true; error.value = "";
+  const keyword = query.value.trim();
   try {
-    const [items, total] = await Promise.all([listArchivedFeeds(pageSize.value, first.value, category.value), countArchivedFeeds(category.value)]);
+    const [items, total] = await Promise.all([listArchivedFeeds(pageSize.value, first.value, category.value, "desc", keyword), countArchivedFeeds(category.value, keyword)]);
     records.value = items; totalRecords.value = total; selectedIds.value = []; avatarTimestamp.value = Date.now();
     if (!items.length && first.value > 0 && total > 0) { first.value = Math.max(0, Math.floor((total - 1) / pageSize.value) * pageSize.value); await load(); }
     else { await nextTick(); observeArchiveImages(); }
@@ -235,7 +234,7 @@ const pkgIncremental = ref(false);
 const pkgExporting = ref(false);
 const pkgResult = ref<ExportPackageStats>();
 const pkgProgress = ref<ExportProgress>({ status: "idle", current: 0, total: 0, message: "尚未开始导出" });
-let pkgProgressTimer: ReturnType<typeof setInterval> | undefined;
+let unlistenPackageProgress: UnlistenFn | undefined;
 const pkgCategories = ref<ArchiveCategory[]>(["self", "other", "guestbook"]);
 const pkgCategoryOptions: { label: string; value: ArchiveCategory }[] = [
   { label: "本人动态", value: "self" },
@@ -250,14 +249,6 @@ const pkgProgressPercent = computed(() => pkgProgress.value.total > 0
   : 0);
 async function refreshPackageProgress() {
   try { pkgProgress.value = await getExportProgress(); } catch { /* 导出状态查询失败不影响导出本身 */ }
-}
-function startPackageProgressPolling() {
-  if (pkgProgressTimer) return;
-  pkgProgressTimer = setInterval(() => { void refreshPackageProgress(); }, 500);
-}
-function stopPackageProgressPolling() {
-  if (pkgProgressTimer) window.clearInterval(pkgProgressTimer);
-  pkgProgressTimer = undefined;
 }
 function openPackageDialog() {
   pkgResult.value = undefined;
@@ -330,7 +321,6 @@ async function exportSingleFile(kind: "json" | "md") {
 async function exportPackage() {
   if (pkgExporting.value || !pkgCategories.value.length) return;
   pkgExporting.value = true; error.value = "";
-  startPackageProgressPolling();
   try {
     const date = new Date().toISOString().slice(0, 10);
     const path = await save({
@@ -344,7 +334,6 @@ async function exportPackage() {
     if (String(reason) !== "EXPORT_CANCELLED") error.value = `导出离线包失败：${String(reason)}`;
   } finally {
     pkgExporting.value = false;
-    stopPackageProgressPolling();
     await refreshPackageProgress();
   }
 }
@@ -392,6 +381,9 @@ async function confirmDelete() {
   finally { deleting.value = false; }
 }
 onMounted(async () => {
+  unlistenPackageProgress = await listen<ExportProgress>("export-progress", (event) => {
+    pkgProgress.value = event.payload;
+  });
   const routeQuery = route.query.q;
   query.value = typeof routeQuery === "string" ? routeQuery : "";
   if (authStore.loggedIn) await load();
@@ -399,8 +391,17 @@ onMounted(async () => {
 watch(category, () => { first.value = 0; query.value = ""; void load(); });
 watch(() => route.query.q, (value) => {
   query.value = typeof value === "string" ? value : "";
+  first.value = 0;
+  if (authStore.loggedIn) void load();
 });
-onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVideos(); stopPackageProgressPolling(); });
+// 搜索词变化时在服务端重新查询（防抖），保证分页与总数都是全库结果。
+let searchTimer: ReturnType<typeof setTimeout> | undefined;
+watch(query, (value, previous) => {
+  if (value === previous) return;
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => { first.value = 0; if (authStore.loggedIn) void load(); }, 300);
+});
+onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVideos(); unlistenPackageProgress?.(); if (searchTimer) clearTimeout(searchTimer); });
 </script>
 
 <template>

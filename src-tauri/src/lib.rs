@@ -13,18 +13,38 @@ fn exit_app(app: tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .manage(archive::ArchiveState::new())
         .manage(albums::AlbumState::new())
         .manage(export::ExportState::new())
         .manage(qlogin::QLoginState::new())
         .manage(qzone::RecycleAuthState::default())
         .manage(updater::UpdateDownloadState::default())
+        .setup(|app| {
+            // 绑定 AppHandle，归档/相册/导出进度变化时直接向渲染层推事件，
+            // 前端不再需要高频轮询。
+            use tauri::Manager;
+            let handle = app.handle().clone();
+            app.state::<archive::ArchiveState>()
+                .bind_app(handle.clone());
+            app.state::<albums::AlbumState>().bind_app(handle.clone());
+            app.state::<export::ExportState>().bind_app(handle);
+            Ok(())
+        })
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_process::init());
+
+    // Tauri 官方签名更新器只在桌面端启用；Android/iOS 继续使用发布页手动安装。
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    }
+
+    builder
         .invoke_handler(tauri::generate_handler![
             exit_app,
             updater::check_for_update,
@@ -91,6 +111,7 @@ pub fn run() {
             albums::reset_failed_album_photos,
             albums::delete_archived_album,
             albums::load_album_photo,
+            albums::save_archived_album_photo,
             export::export_archive_package,
             export::get_export_progress,
             export::cancel_export,

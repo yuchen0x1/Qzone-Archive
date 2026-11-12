@@ -2,6 +2,16 @@
 
 > 项目状态：正常更新中。
 
+## 最新更新
+
+### v1.3.4 — 2026-11-12
+
+- Windows 更新检查在清单暂缺时安全回退到发布页。
+- 后续 Release 仅发布 Windows NSIS 安装包及签名更新清单。
+- 备份、搜索、相册进度和媒体缓存稳定性改进。
+
+完整发布记录见 [`docs/releases/release-notes.md`](docs/releases/release-notes.md)。
+
 > [!CAUTION]
 > **请务必仔细甄别软件来源。除本仓库 Releases 发布的安装包外，任何其他来源的程序均不可信，请勿下载或使用，以免造成账号信息泄露。**
 
@@ -54,22 +64,20 @@ QQ 空间中的历史动态与互动内容长期依赖第三方平台接口，�
 - **离线包导出**：把动态分类页、已备份相册、本地缓存的图片视频和结构化 `data.json` 打包为一个 ZIP，在断网设备上也能完整浏览。
 - **相册回收站恢复**：验证独立密码后浏览回收站相册与照片，可将单张照片恢复到新建或已有相册，也可整体恢复相册。
 - **数据管理**：不同 QQ 账号的归档数据隔离存储；可删除所选归档、清空归档，或在设置中一键删除全部本地数据（不可撤销）。
-- **在线更新**：启动时自动检查发布仓库的新版本，也可在“关于”页手动检查；更新源默认使用 GitHub Releases，限流或不可达时自动回退 Gitee 接口与 GitHub 订阅源探测，也可在构建时切换发布源，发现新版本后会按当前平台提供对应安装包下载入口。
+- **在线更新**：Windows 桌面端使用 Tauri 官方签名更新器，启动时或在“关于”页手动检查 GitHub Releases，下载完成并通过签名校验后才安装；其他平台按源码构建。
 - **跨平台**：支持 Windows、macOS、Linux 桌面端和 Android 移动端；发布同时产出未签名的 iOS IPA（需自行签名后侧载）。
 
 ## 安装
 
 ### 下载发布包
 
-从当前维护仓库的 [Releases](https://github.com/yuchen0x1/Qzone-Archive/releases) 页面下载对应平台的安装包：
-
-- Windows：`.exe` 安装程序
-- macOS：`.dmg` 安装包（x64 / ARM64）
-- Linux：`.AppImage`、`.deb` 或 `.rpm` 包；NixOS 用户可下载 `qzonearchive-nixos-*` 归档
-- Android：`.apk` 安装包
-- iOS：未签名 `.ipa`（需使用 AltStore、Sideloadly 等工具自行签名后侧载）
+从当前维护仓库的 [Releases](https://github.com/yuchen0x1/Qzone-Archive/releases) 页面下载 Windows `.exe` 安装程序。后续 Release 只上传 Windows NSIS 安装包、Tauri 签名文件和 `latest.json`；历史 Release 可能仍保留旧平台资产，其他平台可按源码运行或构建。
 
 首次启动需要阅读并同意应用内的《免责声明与使用须知》。想尝鲜最新功能，可关注 [Releases](https://github.com/yuchen0x1/Qzone-Archive/releases) 页面中的预发布版本（如有，仅建议测试使用）。
+
+### 自动更新与发布
+
+桌面端更新清单使用 `latest.json`，由 GitHub Actions 在 `vMAJOR.MINOR.PATCH` 标签上构建并签名，并随 Windows Release 直接发布。更新签名私钥只保存在 GitHub Actions Secrets，客户端只包含公钥。完整的 Secrets 配置、发布步骤、故障恢复和 Windows-only 资产策略见 [`docs/AUTO_UPDATE.md`](docs/AUTO_UPDATE.md)。
 
 ### 从源码运行
 
@@ -231,7 +239,7 @@ QQ 视频地址带有时效签名，过期后需要重新归档以更新地址�
 程序会优先读取本地缓存，失败时自动尝试原始地址；列表中可点击“加载失败，重试”。
 
 **检查更新提示失败？**
-更新检查默认访问 GitHub 的发布接口，失败（如共享出口 IP 触发 API 限流）时自动依次回退 Gitee 接口与 GitHub `releases.atom` 订阅探测（订阅不含资产列表，此时会提示前往发布页下载）；也可在构建时通过 `QZONE_UPDATE_API_URL` 指定单一发布源。全部发布源不可达时会提示失败，不影响其他功能。
+桌面端更新检查会优先验证 GitHub Releases 的 Tauri 签名清单；旧 Release 尚未上传 `latest.json` 时会回退到版本接口，仅提示打开发布页，不会执行未签名的应用内安装。当前版本仍可继续使用。发布页只提供 Windows 安装包；移动端检查失败时同样只提供发布页入口。
 
 **如何备份归档数据？**
 应用数据目录中的 `qzone-archive.sqlite3` 和媒体缓存就是完整归档数据，可整体复制；也可以使用“导出全部”生成离线 HTML。重要资料建议定期另行备份。

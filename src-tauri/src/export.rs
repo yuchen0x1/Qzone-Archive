@@ -12,7 +12,7 @@ use std::{
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use serde_json::json;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 use crate::{
@@ -54,6 +54,7 @@ impl Default for ExportProgress {
 pub struct ExportState {
     progress: Arc<Mutex<ExportProgress>>,
     cancel: Arc<AtomicBool>,
+    app: Arc<Mutex<Option<tauri::AppHandle>>>,
 }
 
 impl Default for ExportState {
@@ -61,6 +62,7 @@ impl Default for ExportState {
         Self {
             progress: Arc::new(Mutex::new(ExportProgress::default())),
             cancel: Arc::new(AtomicBool::new(false)),
+            app: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -70,9 +72,23 @@ impl ExportState {
         Self::default()
     }
 
+    pub fn bind_app(&self, app: tauri::AppHandle) {
+        if let Ok(mut slot) = self.app.lock() {
+            *slot = Some(app);
+        }
+    }
+
     fn set_progress(&self, update: impl FnOnce(&mut ExportProgress)) {
-        if let Ok(mut progress) = self.progress.lock() {
-            update(&mut progress);
+        let Ok(mut progress) = self.progress.lock() else {
+            return;
+        };
+        update(&mut progress);
+        let snapshot = progress.clone();
+        drop(progress);
+        if let Ok(slot) = self.app.lock() {
+            if let Some(app) = slot.as_ref() {
+                let _ = app.emit("export-progress", snapshot);
+            }
         }
     }
 
@@ -109,6 +125,7 @@ pub struct ExportPackageStats {
 /// 导出离线包：HTML 分类页 + 相册页 + 已缓存的图片/视频 + 结构化 data.json，
 /// 全部打包为一个 zip。包内 HTML 使用相对路径引用媒体，可在任何设备离线打开。
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn export_archive_package(
     app: tauri::AppHandle,
     login: tauri::State<'_, QLoginState>,

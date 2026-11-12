@@ -55,7 +55,7 @@ async function loadDashboard() {
   try {
     const [stats, items, task, ranks, onThisDay] = await Promise.all([
       getArchiveOverview(),
-      listArchivedFeeds(3, 0),
+      listArchivedFeeds(3, 0, "self", "desc"),
       getArchiveProgress(),
       getInteractionRanking(8),
       listOnThisDayFeeds().catch(() => []),

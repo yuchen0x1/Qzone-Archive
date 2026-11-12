@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { storeToRefs } from "pinia";
 import { useRoute, useRouter } from "vue-router";
 import { arch, platform } from "@tauri-apps/plugin-os";
@@ -12,7 +12,16 @@ import LoginDialog from "../components/LoginDialog.vue";
 import sidebarToggleIcon from "../assets/sidebar-toggle.png";
 import { useAppStore } from "../stores/app";
 import { useAuthStore } from "../stores/auth";
-import { assetForPlatform, checkForUpdate, updateAssetLabel, type UpdateInfo, type UpdatePlatform } from "../utils/updater";
+import {
+  assetForPlatform,
+  checkForUpdate,
+  checkOfficialForUpdate,
+  officialUpdateInfo,
+  supportsInAppUpdate,
+  updateAssetLabel,
+  type UpdateInfo,
+  type UpdatePlatform,
+} from "../utils/updater";
 import { getAutoUpdate } from "../utils/appSettings";
 import { globalSearch, type SearchHit, type SearchResult } from "../utils/qzone";
 
@@ -27,20 +36,24 @@ const logoutLoading = ref(false);
 const { darkMode, privacyMode, sidebarCollapsed, themeIcon, privacyIcon } = storeToRefs(appStore);
 const { loggedIn, user } = storeToRefs(authStore);
 const searchPopover = ref<InstanceType<typeof Popover>>();
+const searchTrigger = ref<HTMLButtonElement>();
 const searchKeyword = ref("");
 const searchResults = ref<SearchResult>({ items: [], hits: [], total: 0 });
 const searchLoading = ref(false);
+const searchError = ref("");
+const searchOpen = ref(false);
 const searchTimer = ref<ReturnType<typeof setTimeout>>();
 let searchSeq = 0;
 async function runSearch() {
   const keyword = searchKeyword.value.trim();
-  if (!keyword) { searchResults.value = { items: [], hits: [], total: 0 }; return; }
+  if (!keyword) { searchResults.value = { items: [], hits: [], total: 0 }; searchError.value = ""; return; }
   const seq = ++searchSeq;
   searchLoading.value = true;
+  searchError.value = "";
   try {
     const result = await globalSearch(keyword, 8, 0);
     if (seq === searchSeq) searchResults.value = result;
-  } catch { if (seq === searchSeq) searchResults.value = { items: [], hits: [], total: 0 }; }
+  } catch { if (seq === searchSeq) { searchResults.value = { items: [], hits: [], total: 0 }; searchError.value = "搜索暂时不可用，请稍后重试。"; } }
   finally { if (seq === searchSeq) searchLoading.value = false; }
 }
 function resetSearch() {
@@ -48,7 +61,26 @@ function resetSearch() {
   searchSeq += 1;
   searchKeyword.value = "";
   searchLoading.value = false;
+  searchError.value = "";
   searchResults.value = { items: [], hits: [], total: 0 };
+}
+function onSearchShow() {
+  searchOpen.value = true;
+  resetSearch();
+  window.setTimeout(() => document.querySelector<HTMLInputElement>(".search-popover-input input")?.focus(), 0);
+}
+function onGlobalKeydown(event: KeyboardEvent) {
+  const target = event.target;
+  const editing = target instanceof HTMLElement && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName));
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k" && !editing) {
+    event.preventDefault();
+    searchTrigger.value?.click();
+    return;
+  }
+  if (event.key === "Escape" && searchOpen.value) {
+    event.preventDefault();
+    searchPopover.value?.hide();
+  }
 }
 function onSearchInput() {
   if (searchTimer.value) clearTimeout(searchTimer.value);
@@ -125,24 +157,47 @@ const startupUpdate = ref<UpdateInfo | null>(null);
 const startupUpdateVisible = ref(false);
 
 onMounted(async () => {
+  window.addEventListener("keydown", onGlobalKeydown);
   // 仅当用户在设置中开启"自动检查更新"时，启动才静默检查一次（失败不打扰用户）。
   if (!getAutoUpdate()) return;
   try {
-    startupUpdate.value = await checkForUpdate();
+    const currentPlatform = platform() as UpdatePlatform;
+    if (supportsInAppUpdate(currentPlatform)) {
+      // 启动检查只负责提示；真正的下载与签名安装在“关于”页完成。
+      try {
+        const signedUpdate = await checkOfficialForUpdate();
+        if (signedUpdate) {
+          startupUpdate.value = officialUpdateInfo(signedUpdate);
+          await signedUpdate.close();
+        }
+      } catch {
+        // 兼容尚未上传 latest.json 的旧 Release；仅提示用户去发布页查看。
+        const fallback = await checkForUpdate();
+        startupUpdate.value = fallback ? { ...fallback, manual_only: true } : null;
+      }
+    } else {
+      startupUpdate.value = await checkForUpdate();
+    }
     if (startupUpdate.value) startupUpdateVisible.value = true;
   } catch { /* 静默失败 */ }
 });
+onUnmounted(() => window.removeEventListener("keydown", onGlobalKeydown));
 function currentUpdateAsset() {
   if (!startupUpdate.value) return undefined;
   const currentPlatform = platform() as UpdatePlatform;
   return assetForPlatform(startupUpdate.value.assets, currentPlatform, arch());
 }
 async function openUpdatePage() {
-  if (!startupUpdate.value) return;
+  const update = startupUpdate.value;
+  if (!update) return;
   startupUpdateVisible.value = false;
+  if (update.official || update.manual_only) {
+    await router.push("/about");
+    return;
+  }
   try {
     const { openUrl } = await import("@tauri-apps/plugin-opener");
-    await openUrl(currentUpdateAsset()?.browser_download_url ?? startupUpdate.value.release_url);
+    await openUrl(currentUpdateAsset()?.browser_download_url ?? update.release_url);
   } catch { /* 打开失败时保留窗口，用户可重试 */ }
 }
 async function logout() {
@@ -191,10 +246,11 @@ async function logout() {
       <header class="topbar">
         <div><p class="topbar-eyebrow">QZONE ARCHIVE</p><h1>{{ pageTitle }}</h1></div>
         <div class="topbar-actions">
-          <Button icon="pi pi-search" severity="secondary" text rounded aria-label="全局搜索" @click="searchPopover?.toggle($event)" />
-          <Popover ref="searchPopover" class="search-popover" @show="resetSearch">
+          <button ref="searchTrigger" class="topbar-icon-button" type="button" aria-label="全局搜索（Ctrl 或 Command + K）" title="全局搜索 · Ctrl/⌘ K" @click="searchPopover?.toggle($event)"><i class="pi pi-search" /></button>
+          <Popover ref="searchPopover" class="search-popover" @show="onSearchShow" @hide="searchOpen = false">
             <div class="search-popover-input"><i class="pi pi-search" /><InputText v-model="searchKeyword" placeholder="搜索全部归档内容…" @input="onSearchInput" @keyup.enter="openArchives" /></div>
             <div v-if="searchLoading" class="search-popover-hint"><i class="pi pi-spinner pi-spin" />搜索中…</div>
+            <div v-else-if="searchError" class="search-popover-hint search-popover-error" role="alert"><i class="pi pi-exclamation-circle" />{{ searchError }}</div>
             <div v-else-if="searchResults.hits.length" class="search-popover-results">
               <button v-for="hit in searchResults.hits" :key="`${hit.kind}-${hit.refId}`" type="button" class="search-popover-item" @click="goToHit(hit)">
                 <span class="search-popover-avatar"><i :class="hit.kind === 'contact' ? 'pi pi-user' : hit.kind === 'album' || hit.kind === 'photo' ? 'pi pi-image' : 'pi pi-file-edit'" /></span>
@@ -256,7 +312,9 @@ async function logout() {
     <Dialog v-model:visible="startupUpdateVisible" modal :draggable="false" class="update-dialog" header="发现新版本">
       <div v-if="startupUpdate" class="update-dialog-content">
         <p>新版本 <strong>v{{ startupUpdate.latest_version }}</strong> 已发布（当前 v{{ startupUpdate.current_version }}），建议尽快升级以获得修复与新功能。</p>
-        <ul v-if="startupUpdate.assets.length" class="update-assets">
+        <p v-if="startupUpdate.official">桌面端更新包已通过 Tauri 签名清单验证，请在“关于”页确认下载和安装。</p>
+        <p v-else-if="startupUpdate.manual_only">签名更新清单暂不可用，请打开“关于”页进入发布页手动下载 Windows 安装包。</p>
+        <ul v-if="startupUpdate.assets.length && !startupUpdate.manual_only" class="update-assets">
           <li v-for="asset in startupUpdate.assets" :key="asset.name">
             <span>{{ updateAssetLabel(asset.name) }}（{{ asset.name }}）</span>
             <small>{{ (asset.size / 1024 / 1024).toFixed(1) }} MB</small>
@@ -265,7 +323,7 @@ async function logout() {
       </div>
       <template #footer>
         <Button label="暂不更新" severity="secondary" text @click="startupUpdateVisible = false" />
-        <Button label="下载对应安装包" icon="pi pi-download" @click="openUpdatePage" />
+        <Button :label="startupUpdate?.official ? '查看并安装更新' : '打开发布页'" icon="pi pi-download" @click="openUpdatePage" />
       </template>
     </Dialog>
   </div>

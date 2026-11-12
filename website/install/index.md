@@ -4,9 +4,9 @@ title: 安装
 
 # 安装
 
-从 [Gitee Releases](https://gitee.com/yuchen0x1/Qzone-Archive/releases) 下载与设备对应的最新版本。
+从 [GitHub Releases](https://github.com/yuchen0x1/Qzone-Archive/releases) 下载 Windows `.exe` 安装程序。后续 Release 只上传 Windows 安装包、签名文件和 `latest.json`；其他平台请按源码构建。
 
-网站打开下载区域时会读取公开 Release API，显示当前线上版本、发布时间和当前设备对应的安装包；网络不可达时仍可直接打开 Release 页面。如需切换发布仓库（如 GitHub/GitCode），构建环境可通过 VITE_UPDATE_API_URL 和 VITE_RELEASES_URL 配置更新源。桌面应用启动时会自动检查一次更新，也可以在“关于”页面手动检查，发现新版本后直接下载对应平台安装包并按系统提示完成安装。
+网站打开下载区域时会读取公开 Release API，显示当前线上版本和 Windows 安装包；网络不可达时仍可直接打开 Release 页面。桌面应用使用 Tauri 官方签名更新器，启动时或在“关于”页手动检查，只有签名校验通过后才下载并安装。
 
 ## Windows
 
@@ -14,19 +14,19 @@ title: 安装
 
 ## macOS
 
-根据设备下载 Intel 或 Apple Silicon 对应的 `.dmg`。首次启动时，系统可能要求在“隐私与安全性”中确认打开来源未知的应用。
+当前不随 Release 发布安装包，请参考开发文档从源码构建。首次启动时，系统可能要求在“隐私与安全性”中确认打开来源未知的应用。
 
 ## Android
 
-下载 `.apk`，允许浏览器或文件管理器安装应用后按提示完成安装。请仅从项目 Releases 页面获取安装包。
+当前不随 Release 发布 APK，请参考开发文档从源码构建。
 
 ## iOS
 
-下载未签名 `.ipa`，使用 AltStore、SideStore、Sideloadly 等侧载工具自行签名后安装。IPA 不能直接安装到 iPhone，也不能直接上传 App Store。
+当前不随 Release 发布 IPA，请参考开发文档从源码构建并自行签名。IPA 不能直接安装到 iPhone，也不能直接上传 App Store。
 
 ## Linux
 
-每个 Release 提供三种 Linux 安装包（具体文件名以 Release 页面实际下载到的为准，下面用 `*.ext` 通配符代替）：
+当前不随 Release 发布 Linux 安装包；以下命令仅适用于从源码或历史 Release 获取对应文件后的本地安装：
 
 - `.deb`：适合 Debian、Ubuntu 及其衍生发行版
 - `.rpm`：适合 Fedora、openSUSE、RHEL 系发行版

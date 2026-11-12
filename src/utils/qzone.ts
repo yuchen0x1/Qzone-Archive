@@ -42,11 +42,11 @@ export const cancelFeedArchive = () => invoke<void>("cancel_feed_archive");
 export const listArchiveSkips = () => invoke<ArchiveSkipItem[]>("list_archive_skips");
 export const retryArchiveSkip = (id: number) => invoke<ArchiveSkipRetryResult>("retry_archive_skip", { id });
 export const retryAllArchiveSkips = (intervalMs: number) => invoke<ArchiveSkipBatchRetryResult>("retry_all_archive_skips", { intervalMs });
-export const listArchivedFeeds = (limit = 100, offset = 0, category: ArchiveCategory = "self") => invoke<ArchiveItem[]>("list_archived_feeds", { limit, offset, category });
+export const listArchivedFeeds = (limit = 100, offset = 0, category: ArchiveCategory = "self", order: "asc" | "desc" = "desc", keyword?: string) => invoke<ArchiveItem[]>("list_archived_feeds", { limit, offset, category, order, keyword: keyword || null });
 export const listOnThisDayFeeds = () => invoke<ArchiveItem[]>("list_on_this_day_feeds");
 export const listArchivedMedia = (limit = 60, offset = 0, year?: number) => invoke<ArchiveMediaPage>("list_archived_media", { limit, offset, year });
 export const getArchivedFeed = (id: number) => invoke<ArchiveItem>("get_archived_feed", { id });
-export const countArchivedFeeds = (category: ArchiveCategory = "self") => invoke<number>("count_archived_feeds", { category });
+export const countArchivedFeeds = (category: ArchiveCategory = "self", keyword?: string) => invoke<number>("count_archived_feeds", { category, keyword: keyword || null });
 export const exportArchivedHtml = (category: ArchiveCategory, ids?: number[]) => invoke<string>("export_archived_html", { category, ids });
 export const loadArchivedImage = (id: number, pictureIndex: number) => invoke<string>("load_archived_image", { id, pictureIndex });
 export const loadArchivedVideo = (id: number) => invoke<string>("load_archived_video", { id });
@@ -106,6 +106,7 @@ export const listArchivedAlbumPhotos = (albumId: string, limit = 60, offset = 0)
 export const resetFailedAlbumPhotos = (albumId: string) => invoke<number>("reset_failed_album_photos", { albumId });
 export const deleteArchivedAlbum = (albumId: string) => invoke<number>("delete_archived_album", { albumId });
 export const loadAlbumPhoto = (photoId: number) => invoke<string>("load_album_photo", { photoId });
+export const saveArchivedAlbumPhoto = (photoId: number, targetPath: string) => invoke<number>("save_archived_album_photo", { photoId, targetPath });
 export interface ExportPackageStats { targetPath: string; dynamicCount: number; htmlFiles: number; mediaFiles: number; albumCount: number; totalBytes: number; }
 export type ExportStatus = "idle" | "running" | "completed" | "cancelled" | "error";
 export interface ExportProgress { status: ExportStatus; current: number; total: number; message: string; }

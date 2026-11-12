@@ -5,13 +5,16 @@ import ProgressBar from "primevue/progressbar";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { relaunch } from "@tauri-apps/plugin-process";
 import {
   assetForPlatform,
   acceleratedUrl,
   cancelUpdateDownload,
   checkForUpdate,
+  checkOfficialForUpdate,
   downloadUpdateAsset,
   formatBytes,
+  officialUpdateInfo,
   runUpdateInstaller,
   supportsInAppUpdate,
   RELEASES_PAGE_URL,
@@ -19,6 +22,8 @@ import {
   type UpdateDownloadProgress,
   type UpdateInfo,
   type UpdatePlatform,
+  type OfficialDownloadEvent,
+  type OfficialUpdate,
 } from "../utils/updater";
 import { arch, platform } from "@tauri-apps/plugin-os";
 
@@ -27,6 +32,7 @@ const updateChecking = ref(false);
 const updateChecked = ref(false);
 const updateInfo = ref<UpdateInfo | null>(null);
 const updateError = ref("");
+const officialUpdate = ref<OfficialUpdate | null>(null);
 
 const currentPlatform = platform() as UpdatePlatform;
 const canUpdateInApp = supportsInAppUpdate(currentPlatform);
@@ -57,6 +63,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   unlistenProgress?.();
+  void closeOfficialUpdate();
 });
 
 async function checkUpdate() {
@@ -65,15 +72,40 @@ async function checkUpdate() {
   updateChecked.value = false;
   updateError.value = "";
   resetDownload();
+  await closeOfficialUpdate();
   try {
-    updateInfo.value = await checkForUpdate();
-  } catch (reason) {
+    if (canUpdateInApp) {
+      // 桌面端只接受 Tauri 官方签名更新器的结果，避免把未签名 Release
+      // 资产误当成可安装更新。旧 Release 可能还没有 latest.json，
+      // 此时仅回退到 GitHub API 读取版本并打开发布页，不执行应用内安装。
+      try {
+        officialUpdate.value = await checkOfficialForUpdate();
+        updateInfo.value = officialUpdate.value ? officialUpdateInfo(officialUpdate.value) : null;
+      } catch {
+        const fallback = await checkForUpdate();
+        updateInfo.value = fallback ? { ...fallback, manual_only: true } : null;
+      }
+    } else {
+      updateInfo.value = await checkForUpdate();
+    }
+  } catch {
     updateInfo.value = null;
-    updateError.value = String(reason);
+    // 不把 Tauri/网络内部错误直接展示给用户，保留可操作的发布页入口。
+    updateError.value = "暂时无法检查更新，请稍后重试或打开发布页。";
   } finally {
     updateChecking.value = false;
     updateChecked.value = true;
   }
+}
+
+async function closeOfficialUpdate() {
+  if (!officialUpdate.value) return;
+  try {
+    await officialUpdate.value.close();
+  } catch {
+    /* 更新资源释放失败不影响页面继续使用 */
+  }
+  officialUpdate.value = null;
 }
 
 function resetDownload() {
@@ -92,6 +124,14 @@ function currentUpdateAsset(info: UpdateInfo) {
 
 /** 桌面平台走应用内下载；移动端仍交给系统浏览器下载安装包。 */
 async function startUpdate(info: UpdateInfo) {
+  if (info.official && officialUpdate.value) {
+    await startOfficialUpdate(officialUpdate.value);
+    return;
+  }
+  if (info.manual_only) {
+    await openUrl(info.release_url);
+    return;
+  }
   const asset = currentUpdateAsset(info);
   if (!asset) return;
   if (!canUpdateInApp) {
@@ -110,7 +150,7 @@ async function startUpdate(info: UpdateInfo) {
     let lastError = "";
     for (const url of urls) {
       try {
-        downloadedUpdate.value = await downloadUpdateAsset(url);
+        downloadedUpdate.value = await downloadUpdateAsset(url, asset.digest);
         downloadState.value = "done";
         downloadPercent.value = 100;
         return;
@@ -121,6 +161,38 @@ async function startUpdate(info: UpdateInfo) {
       }
     }
     throw new Error(lastError);
+  } catch (reason) {
+    downloadState.value = "error";
+    downloadError.value = String(reason);
+  }
+}
+
+async function startOfficialUpdate(update: OfficialUpdate) {
+  downloadState.value = "downloading";
+  downloadPercent.value = 0;
+  downloadReceived.value = 0;
+  downloadTotal.value = 0;
+  downloadError.value = "";
+  try {
+    await update.download((event: OfficialDownloadEvent) => {
+      if (event.event === "Started") {
+        downloadTotal.value = event.data.contentLength ?? 0;
+      } else if (event.event === "Progress") {
+        downloadReceived.value += event.data.chunkLength;
+        downloadPercent.value = downloadTotal.value
+          ? Math.min(100, (downloadReceived.value / downloadTotal.value) * 100)
+          : 0;
+      } else {
+        downloadPercent.value = 100;
+      }
+    });
+    downloadedUpdate.value = {
+      path: "",
+      name: `QzoneArchive_${update.version}`,
+      size: downloadReceived.value,
+    };
+    downloadState.value = "done";
+    downloadPercent.value = 100;
   } catch (reason) {
     downloadState.value = "error";
     downloadError.value = String(reason);
@@ -145,8 +217,14 @@ async function installUpdate() {
   installing.value = true;
   downloadError.value = "";
   try {
-    await runUpdateInstaller(downloadedUpdate.value.path);
-    // Windows 下应用随即退出；其余平台弹出系统安装界面或目录
+    if (updateInfo.value?.official && officialUpdate.value) {
+      await officialUpdate.value.install({ restartAfterInstall: currentPlatform === "windows" });
+      // 官方插件在 Windows 安装器启动后退出应用；macOS/Linux 需要显式重启。
+      if (currentPlatform !== "windows") await relaunch();
+    } else {
+      await runUpdateInstaller(downloadedUpdate.value.path);
+      // 自定义移动/旧桌面路径：Windows 下应用随即退出；其余平台弹出系统安装界面或目录。
+    }
   } catch (reason) {
     installing.value = false;
     downloadError.value = String(reason);
@@ -164,6 +242,15 @@ interface ChangelogEntry {
 }
 
 const CHANGELOG: ChangelogEntry[] = [
+  {
+    version: "1.3.4",
+    date: "2026-11-12",
+    highlights: [
+      "修复 Windows 更新清单缺失时的检查提示，改为安全回退到发布页",
+      "发布流程收敛为 Windows NSIS，并生成 Tauri 签名更新清单",
+      "提升备份、搜索、相册进度和媒体缓存的稳定性",
+    ],
+  },
   {
     version: "1.3.3",
     date: "2026-11-08",
@@ -289,7 +376,7 @@ function isCurrentVersion(version: string) {
             <i class="pi pi-download" />
             <div>
               <strong>v{{ updateInfo.latest_version }}{{ updateInfo.published_at && !Number.isNaN(new Date(updateInfo.published_at).getTime()) ? ` · ${new Date(updateInfo.published_at).toLocaleDateString()}` : "" }}</strong>
-              <small>{{ currentUpdateAsset(updateInfo) ? `${currentUpdateAsset(updateInfo)!.name} · ${formatBytes(currentUpdateAsset(updateInfo)!.size)}` : "请在发布页手动下载" }}</small>
+            <small>{{ updateInfo.official ? "Tauri 官方签名更新包" : updateInfo.manual_only ? "签名清单暂不可用，请在发布页手动下载" : currentUpdateAsset(updateInfo) ? `${currentUpdateAsset(updateInfo)!.name} · ${formatBytes(currentUpdateAsset(updateInfo)!.size)}` : "请在发布页手动下载" }}</small>
             </div>
           </div>
 
@@ -302,13 +389,15 @@ function isCurrentVersion(version: string) {
               <small v-else>
                 <i class="pi pi-check-circle" /> 下载完成 · {{ formatBytes(downloadedUpdate?.size ?? 0) }}{{ currentPlatform === "windows" ? "，安装后应用会自动重启" : "" }}
               </small>
-              <Button v-if="downloadState === 'downloading'" label="取消下载" size="small" severity="secondary" text @click="cancelDownload" />
-              <Button v-else :label="installing ? '正在启动安装…' : installButtonLabel()" icon="pi pi-play" size="small" :loading="installing" @click="installUpdate" />
+              <Button v-if="downloadState === 'downloading' && !updateInfo.official" label="取消下载" size="small" severity="secondary" text @click="cancelDownload" />
+              <Button v-if="downloadState === 'done'" :label="installing ? '正在启动安装…' : installButtonLabel()" icon="pi pi-play" size="small" :loading="installing" @click="installUpdate" />
             </div>
           </div>
 
-          <div v-else class="about-links">
-            <Button v-if="currentUpdateAsset(updateInfo)" :label="canUpdateInApp ? '下载更新' : '下载安装包'" icon="pi pi-download" @click="startUpdate(updateInfo)" />
+          <p v-if="updateInfo.notes" class="update-notes">{{ updateInfo.notes }}</p>
+
+          <div v-if="downloadState !== 'downloading' && downloadState !== 'done'" class="about-links">
+            <Button v-if="updateInfo.official || (!canUpdateInApp && currentUpdateAsset(updateInfo))" :label="canUpdateInApp ? '下载更新' : '下载安装包'" icon="pi pi-download" @click="startUpdate(updateInfo)" />
             <Button label="发布页" icon="pi pi-external-link" severity="secondary" outlined @click="openUrl(updateInfo.release_url)" />
             <Button v-if="acceleratedUrl(updateInfo.release_url) !== updateInfo.release_url" label="加速打开" icon="pi pi-bolt" severity="secondary" outlined @click="openUrl(acceleratedUrl(updateInfo.release_url))" />
           </div>

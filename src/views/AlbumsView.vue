@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
-import { readFile, writeFile } from "@tauri-apps/plugin-fs";
+import { writeFile } from "@tauri-apps/plugin-fs";
 import Button from "primevue/button";
 import Dialog from "primevue/dialog";
 import ProgressBar from "primevue/progressbar";
@@ -13,7 +14,7 @@ import { useAuthStore } from "../stores/auth";
 import {
   cancelAlbumBackup, deleteArchivedAlbum, getAlbumProgress, listArchivedAlbums,
   listArchivedAlbumPhotos, listRemoteAlbums, loadAlbumPhoto, resetFailedAlbumPhotos,
-  startAlbumBackup, type AlbumPhoto, type AlbumProgress, type AlbumSummary,
+  saveArchivedAlbumPhoto, startAlbumBackup, type AlbumPhoto, type AlbumProgress, type AlbumSummary,
 } from "../utils/qzone";
 
 const PHOTO_PAGE_SIZE = 60;
@@ -45,7 +46,8 @@ const previewLoading = ref(false);
 const previewSrc = ref("");
 const previewPhoto = ref<AlbumPhoto>();
 const savingPreview = ref(false);
-let timer: ReturnType<typeof setInterval> | undefined;
+let clockTimer: ReturnType<typeof setInterval> | undefined;
+let unlistenProgress: UnlistenFn | undefined;
 let imageObserver: IntersectionObserver | undefined;
 
 const running = computed(() => progress.value.status === "running");
@@ -110,25 +112,11 @@ async function refreshProgress() {
   try { progress.value = await getAlbumProgress(); } catch { /* 保留当前状态 */ }
 }
 
-function beginPolling() {
-  if (timer) return;
-  timer = setInterval(async () => {
-    currentTime.value = Date.now();
-    await refreshProgress();
-    if (progress.value.status !== "running") {
-      window.clearInterval(timer);
-      timer = undefined;
-      await refreshAlbums();
-    }
-  }, 600);
-}
-
 async function startBackup(albumIds?: string[]) {
   if (starting.value || running.value || !authStore.loggedIn) return;
   starting.value = true; error.value = "";
   try {
     progress.value = await startAlbumBackup(getArchiveInterval(), albumIds);
-    beginPolling();
     currentTime.value = Date.now();
   } catch (reason) { error.value = `启动相册备份失败：${String(reason)}`; }
   finally { starting.value = false; }
@@ -237,7 +225,7 @@ async function openPreview(photo: AlbumPhoto) {
 }
 
 async function savePreview() {
-  if (!previewPhoto.value || !previewSrc.value || savingPreview.value) return;
+  if (!previewPhoto.value || savingPreview.value) return;
   savingPreview.value = true; photoError.value = "";
   try {
     const photo = previewPhoto.value;
@@ -245,10 +233,13 @@ async function savePreview() {
     const name = `${(photo.name || `qzone-${photo.picKey}`).replace(/[\\/:*?"<>|]/g, "_")}.${extension}`;
     const path = await save({ defaultPath: name, filters: [{ name: "图片", extensions: [extension, "jpg", "png", "webp"] }] });
     if (!path) return;
-    if (photo.localPath) {
-      await writeFile(path, new Uint8Array(await readFile(photo.localPath)));
-    } else {
+    try {
+      await saveArchivedAlbumPhoto(photo.id, path);
+    } catch (reason) {
+      // 本地尚未缓存时先按需下载，再写入用户选择的位置。
+      if (photo.localPath || !previewSrc.value) throw reason;
       const response = await window.fetch(previewSrc.value);
+      if (!response.ok) throw reason;
       await writeFile(path, new Uint8Array(await response.arrayBuffer()));
     }
   } catch (reason) { photoError.value = `保存照片失败：${String(reason)}`; }
@@ -280,22 +271,27 @@ async function retryFailed(album: AlbumSummary) {
 
 onMounted(async () => {
   currentTime.value = Date.now();
+  clockTimer = window.setInterval(() => { currentTime.value = Date.now(); }, 1000);
+  unlistenProgress = await listen<AlbumProgress>("album-progress", (event) => {
+    const wasRunning = progress.value.status === "running";
+    progress.value = event.payload;
+    if (wasRunning && event.payload.status !== "running") void refreshAlbums();
+  });
   await refreshProgress();
   if (authStore.loggedIn) await refreshAlbums();
-  if (running.value || rateLimited.value) beginPolling();
 });
 watch(() => authStore.loggedIn, async (loggedIn) => {
   if (loggedIn) {
     await refreshProgress();
     await refreshAlbums();
-    if (running.value || rateLimited.value) beginPolling();
   } else {
     albums.value = [];
     photoDialogVisible.value = false;
   }
 });
 onBeforeUnmount(() => {
-  if (timer) window.clearInterval(timer);
+  if (clockTimer) window.clearInterval(clockTimer);
+  unlistenProgress?.();
   imageObserver?.disconnect();
   Object.values(coverSources).forEach((url) => { if (url.startsWith("blob:")) URL.revokeObjectURL(url); });
   Object.values(photoSources).forEach((url) => { if (url.startsWith("blob:")) URL.revokeObjectURL(url); });

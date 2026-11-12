@@ -128,9 +128,9 @@ Follow the [Conventional Commits](https://www.conventionalcommits.org/) specific
 
 ## Branching
 
-- Create short-lived branches from the latest `main`.
-- Branch naming: `docs/<topic>`, `feat/<topic>`, `fix/<topic>`, `ci/<topic>`.
-- Changes intended for the maintained repository should go through Pull Request review. Local verification branches may be used when external publishing is not authorized.
+- `main` is the only active development branch for this workspace.
+- Keep routine project updates and fixes on `main`; do not create additional local or remote feature branches unless the user explicitly asks for one.
+- Keep `main` tracking `origin/main` and verify the worktree before committing or pushing.
 
 ## Verification
 

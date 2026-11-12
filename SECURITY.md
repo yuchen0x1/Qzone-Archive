@@ -2,11 +2,11 @@
 
 ## 支持的版本
 
-安全修复只针对最新发布版本（见 [Releases](https://gitee.com/yuchen0x1/Qzone-Archive/releases)）。请使用最新版本，旧版本不再主动修复安全漏洞。
+安全修复只针对最新发布版本（见 [Releases](https://github.com/yuchen0x1/Qzone-Archive/releases)）。请使用最新版本，旧版本不再主动修复安全漏洞。
 
 ## 报告漏洞
 
-请通过 Gitee 平台私下联系仓库维护者（仓库主页 → 私信），在修复版本发布前不要公开披露漏洞细节。
+请通过 GitHub Security Advisories 私下报告（仓库 → Security → Report a vulnerability），或在仓库主页通过 GitHub 私信联系维护者；在修复版本发布前不要公开披露漏洞细节。
 
 报告内容请包含：
 

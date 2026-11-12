@@ -1,9 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
+import {
+  check as checkSignedUpdate,
+  type DownloadEvent as OfficialDownloadEvent,
+} from "@tauri-apps/plugin-updater";
 
 export interface UpdateAsset {
   name: string;
   size: number;
   browser_download_url: string;
+  /** 发布接口返回的 sha256 摘要（可能为空）；下载时会据此校验安装包。 */
+  digest?: string | null;
 }
 
 export interface UpdateInfo {
@@ -13,6 +19,25 @@ export interface UpdateInfo {
   release_url: string;
   published_at: string;
   assets: UpdateAsset[];
+  /** 桌面端由 Tauri 官方签名更新器提供；移动端仍使用发布资产列表。 */
+  official?: boolean;
+  /** 签名清单暂不可用时仅提供发布页入口，不执行应用内安装。 */
+  manual_only?: boolean;
+}
+
+/**
+ * 只暴露官方 updater 在页面需要的能力，避免把插件内部带私有字段的
+ * Resource 类泄漏到 Vue 状态类型中。
+ */
+export interface OfficialUpdate {
+  currentVersion: string;
+  version: string;
+  date?: string;
+  body?: string;
+  rawJson: Record<string, unknown>;
+  download(onEvent?: (progress: OfficialDownloadEvent) => void): Promise<void>;
+  install(options?: { restartAfterInstall?: boolean }): Promise<void>;
+  close(): Promise<void>;
 }
 
 export type UpdatePlatform = "windows" | "macos" | "linux" | "android" | "ios";
@@ -37,6 +62,30 @@ export function checkForUpdate(): Promise<UpdateInfo | null> {
   return invoke<UpdateInfo | null>("check_for_update");
 }
 
+/**
+ * 桌面端使用 Tauri 官方签名更新器检查更新。
+ * 公钥和 endpoint 由 tauri.conf.json 配置，校验失败时插件会拒绝返回可安装更新。
+ */
+export function checkOfficialForUpdate(): Promise<OfficialUpdate | null> {
+  return checkSignedUpdate({ timeout: 20_000 });
+}
+
+/** 将官方更新对象映射到现有关于页展示模型；安装仍使用原始 Update 对象。 */
+export function officialUpdateInfo(update: OfficialUpdate): UpdateInfo {
+  return {
+    current_version: update.currentVersion,
+    latest_version: update.version,
+    notes: update.body || "",
+    release_url: RELEASES_PAGE_URL,
+    published_at: update.date || "",
+    assets: [],
+    official: true,
+    manual_only: false,
+  };
+}
+
+export type { OfficialDownloadEvent };
+
 export interface UpdateDownloadProgress {
   name: string;
   downloaded: number;
@@ -50,9 +99,10 @@ export interface DownloadedUpdateAsset {
   size: number;
 }
 
-/** 应用内下载更新安装包（后端流式下载并通过 update-download-progress 事件上报进度）。 */
-export function downloadUpdateAsset(url: string): Promise<DownloadedUpdateAsset> {
-  return invoke<DownloadedUpdateAsset>("download_update_asset", { url });
+/** 应用内下载更新安装包（后端流式下载并通过 update-download-progress 事件上报进度）。
+ *  传入所在资产的 digest 时后端会校验 SHA-256，不一致直接删除。 */
+export function downloadUpdateAsset(url: string, digest?: string | null): Promise<DownloadedUpdateAsset> {
+  return invoke<DownloadedUpdateAsset>("download_update_asset", { url, expectedDigest: digest || null });
 }
 
 export function cancelUpdateDownload(): Promise<void> {

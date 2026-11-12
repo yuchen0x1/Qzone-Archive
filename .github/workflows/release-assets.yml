@@ -1,228 +1,57 @@
-name: Release Assets
+name: Repair Windows Release
 
-# 手动触发：为已有 Release 标签补齐 macOS / Linux / Android / iOS 构建产物。
+# 手动触发：为已有 Release 标签重新生成 Windows NSIS、latest.json 和 .sig。
+# 不再上传 macOS / Linux / Android / iOS 产物，避免污染 Windows-only Release。
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 已存在的 Release 标签（例如 v1.3.0）
+        description: 已存在的 Release 标签（例如 v1.3.3）
         required: true
-        default: v1.3.0
+        default: v1.3.3
+      source_ref:
+        description: 包含签名更新配置的分支或提交（旧标签默认使用 main）
+        required: true
+        default: main
 
 permissions:
   contents: write
 
 jobs:
-  macos:
-    name: macOS (universal dmg)
-    runs-on: macos-latest
+  windows:
+    name: Windows NSIS
+    runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out source with updater configuration
+        uses: actions/checkout@v4
         with:
-          ref: refs/tags/${{ inputs.tag }}
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-      - name: Install frontend dependencies
-        run: npm ci
-      - name: Build universal app
-        run: npx tauri build --target universal-apple-darwin
-      - name: Upload dmg artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-dmg
-          path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
-          if-no-files-found: error
+          ref: ${{ inputs.source_ref }}
 
-  linux:
-    name: Linux (deb + AppImage)
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
-          ref: refs/tags/${{ inputs.tag }}
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-      - name: Install frontend dependencies
-        run: npm ci
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
-            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
-            libgtk-3-dev patchelf
-      - name: Build Linux bundles
-        run: npx tauri build --bundles deb,appimage
-      - name: Upload deb artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-deb
-          path: src-tauri/target/release/bundle/deb/*.deb
-          if-no-files-found: error
-      - name: Upload AppImage artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-appimage
-          path: src-tauri/target/release/bundle/appimage/*.AppImage
-          if-no-files-found: error
+          node-version: 20
+          cache: npm
 
-  android:
-    name: Android (signed apk)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: refs/tags/${{ inputs.tag }}
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
+
       - name: Install frontend dependencies
         run: npm ci
-      - name: Restore signing keystore
-        run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/qzone-release.keystore"
-      - name: Build universal APK
+
+      - name: Build and upload signed updater artifacts
+        uses: tauri-apps/tauri-action@v1
         env:
-          TAURI_STORE_FILE: ${{ runner.temp }}/qzone-release.keystore
-          TAURI_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          TAURI_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          TAURI_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: |
-          NDK_VERSION=$(ls "$ANDROID_HOME/ndk" | head -1)
-          export NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
-          echo "Using NDK: $NDK_HOME"
-          npx tauri android build --apk
-      - name: Sign and rename APK
-        env:
-          TAURI_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          TAURI_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          TAURI_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: |
-          VERSION="${{ inputs.tag }}"
-          VERSION="${VERSION#v}"
-          APK_DIR="src-tauri/gen/android/app/build/outputs/apk/universal/release"
-          SIGNED="$APK_DIR/app-universal-release.apk"
-          UNSIGNED="$APK_DIR/app-universal-release-unsigned.apk"
-          BUILD_TOOLS=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
-          BT_DIR="$ANDROID_HOME/build-tools/$BUILD_TOOLS"
-          if [ -f "$SIGNED" ]; then
-            cp "$SIGNED" out.apk
-          elif [ -f "$UNSIGNED" ]; then
-            echo "Gradle produced an unsigned APK; signing with apksigner fallback"
-            "$BT_DIR/zipalign" -f 4 "$UNSIGNED" aligned.apk
-            "$BT_DIR/apksigner" sign \
-              --ks "$RUNNER_TEMP/qzone-release.keystore" \
-              --ks-pass "pass:$TAURI_STORE_PASSWORD" \
-              --ks-key-alias "$TAURI_KEY_ALIAS" \
-              --key-pass "pass:$TAURI_KEY_PASSWORD" \
-              --out out.apk aligned.apk
-            "$BT_DIR/apksigner" verify out.apk
-          else
-            find "$APK_DIR" -name "*.apk"; exit 1
-          fi
-          cp out.apk "QzoneArchive_${VERSION}_android-universal.apk"
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          name: android-apk
-          path: QzoneArchive_*_android-universal.apk
-          if-no-files-found: error
-
-  ios:
-    name: iOS (unsigned ipa)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: refs/tags/${{ inputs.tag }}
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-ios
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-      - name: Install frontend dependencies
-        run: npm ci
-      - name: Generate iOS project
-        run: npx tauri ios init
-      - name: Neutralize rust build phase and regenerate project
-        run: |
-          cd src-tauri/gen/apple
-          sed -i '' 's|npm run -- tauri ios xcode-script|true # rust library prebuilt by cargo|' project.yml
-          xcodegen generate
-      - name: Build Rust static library for iOS device
-        run: cargo build --release --target aarch64-apple-ios --manifest-path src-tauri/Cargo.toml --lib
-      - name: Preplace static library
-        run: |
-          LIB="src-tauri/target/aarch64-apple-ios/release/libqzonearchive_lib.a"
-          test -f "$LIB" || { ls src-tauri/target/aarch64-apple-ios/release/; exit 1; }
-          # tauri iOS projects link against libapp.a (hardcoded LIB_OUTPUT_FILE_NAME)
-          for CFG in release debug; do
-            mkdir -p "src-tauri/gen/apple/Externals/arm64/$CFG"
-            cp "$LIB" "src-tauri/gen/apple/Externals/arm64/$CFG/libapp.a"
-          done
-      - name: Build unsigned app for device
-        run: |
-          PROJ=$(find src-tauri/gen/apple -maxdepth 1 -name "*.xcodeproj" -type d | head -1)
-          test -n "$PROJ" || { ls src-tauri/gen/apple; exit 1; }
-          echo "Using project: $PROJ"
-          SCHEME=$(xcodebuild -list -project "$PROJ" | awk '/Schemes:/{getline; print $1; exit}')
-          echo "Using scheme: $SCHEME"
-          xcodebuild -project "$PROJ" \
-            -scheme "$SCHEME" \
-            -configuration release \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath src-tauri/gen/apple/build \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES \
-            build
-      - name: Package unsigned ipa
-        run: |
-          PRODUCT_DIR="src-tauri/gen/apple/build/Build/Products/release-iphoneos"
-          APP=$(ls -d "$PRODUCT_DIR"/*.app | head -1)
-          test -d "$APP" || { ls "$PRODUCT_DIR" 2>/dev/null; exit 1; }
-          echo "Packaging: $APP"
-          rm -rf Payload
-          mkdir -p Payload
-          cp -R "$APP" Payload/
-          zip -qry "QzoneArchive_${{ inputs.tag }}_ios-unsigned.ipa" Payload
-      - name: Upload ipa artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ios-ipa
-          path: QzoneArchive_*_ios-unsigned.ipa
-          if-no-files-found: error
-
-  publish:
-    name: Upload to release
-    needs: [macos, linux, android, ios]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Show artifacts
-        run: ls -la dist/
-      - name: Upload to GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload "${{ inputs.tag }}" dist/* --repo "${{ github.repository }}" --clobber
+          tagName: ${{ inputs.tag }}
+          releaseName: "QzoneArchive v__VERSION__"
+          releaseBody: "Windows NSIS 安装包与 Tauri 签名更新清单。"
+          releaseDraft: false
+          prerelease: false
+          uploadUpdaterJson: true
+          uploadUpdaterSignatures: true
+          updaterJsonPreferNsis: true
+          args: --bundles nsis

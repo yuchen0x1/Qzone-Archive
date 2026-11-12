@@ -1,0 +1,25 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "mobile",
+  "description": "Capability for the mobile main window",
+  "windows": ["main"],
+  "platforms": ["android", "iOS"],
+  "permissions": [
+    "core:default",
+    "opener:default",
+    "dialog:allow-save",
+    "dialog:allow-open",
+    "fs:allow-write-file",
+    {
+      "identifier": "http:default",
+      "allow": [
+        { "url": "https://h5.qzone.qq.com/*" },
+        { "url": "https://q1.qlogo.cn/*" },
+        { "url": "https://qlogo2.store.qq.com/*" },
+        { "url": "https://photovideo.photo.qq.com/*" },
+        { "url": "https://*.photo.store.qq.com/*" },
+        { "url": "https://*.qpic.cn/*" }
+      ]
+    }
+  ]
+}

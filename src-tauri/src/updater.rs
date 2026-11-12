@@ -22,12 +22,9 @@ const GITHUB_SOURCE: ReleaseSource = ReleaseSource {
     atom_fallback: Some("https://github.com/yuchen0x1/Qzone-Archive/releases.atom"),
 };
 
-const GITEE_SOURCE: ReleaseSource = ReleaseSource {
-    name: "Gitee",
-    api: "https://gitee.com/api/v5/repos/yuchen0x1/Qzone-Archive/releases/latest",
-    releases_page: "https://gitee.com/yuchen0x1/Qzone-Archive/releases",
-    atom_fallback: None,
-};
+// 维护主仓库已迁移到 GitHub，原 Gitee 仓库返回 404，因此不再作为内置回退源：
+// 保留它只会让检查更新在 GitHub 失败后多等一轮网络超时。
+// 白名单里仍保留 gitee.com，方便构建时用 QZONE_UPDATE_API_URL 指向镜像。
 
 const ALLOWED_UPDATE_HOSTS: [&str; 6] = [
     "api.github.com",
@@ -43,6 +40,8 @@ pub struct UpdateAsset {
     pub name: String,
     pub size: u64,
     pub browser_download_url: String,
+    /// GitHub Release API 返回的 `sha256:<hex>` 摘要；Gitee/atom 源可能为空。
+    pub digest: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -83,7 +82,7 @@ fn effective_release_sources() -> Vec<ReleaseSource> {
             atom_fallback: None,
         }];
     }
-    vec![GITHUB_SOURCE, GITEE_SOURCE]
+    vec![GITHUB_SOURCE]
 }
 
 fn is_trusted_source_url(raw: &str) -> bool {
@@ -161,6 +160,7 @@ fn parse_update_info(
                         name,
                         size: asset["size"].as_u64().unwrap_or(0),
                         browser_download_url,
+                        digest: normalized_digest(asset["digest"].as_str()),
                     })
                 })
                 .collect()
@@ -333,6 +333,46 @@ fn is_trusted_download_url(raw: &str) -> bool {
             .contains("https://github.com/yuchen0x1/Qzone-Archive/")
 }
 
+/// 归一化发布接口返回的摘要字段：只接受 `sha256:<64 位 hex>`，
+/// 其它算法或格式一律视为“无摘要”，避免误用导致校验永远失败。
+fn normalized_digest(raw: Option<&str>) -> Option<String> {
+    let value = raw?.trim();
+    let hex = value
+        .strip_prefix("sha256:")
+        .or_else(|| value.strip_prefix("SHA256:"))?;
+    let hex = hex.trim();
+    if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(hex.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// 计算文件 SHA-256（小写 hex）。
+fn file_sha256(path: &std::path::Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read as _;
+
+    let mut file =
+        std::fs::File::open(path).map_err(|error| format!("无法读取安装包以校验：{error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("读取安装包以校验失败：{error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 fn download_file_name(url: &Url) -> String {
     let segment = url
         .path()
@@ -359,12 +399,35 @@ fn download_file_name(url: &Url) -> String {
     }
 }
 
+/// 只允许运行本应用更新缓存目录内的已下载文件，避免命令被用作任意本地程序启动器。
+fn validated_update_asset_path(app: &AppHandle, raw: &str) -> Result<PathBuf, String> {
+    let update_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("无法获取更新缓存目录：{error}"))?
+        .join("update");
+    let cache_dir = std::fs::canonicalize(&update_dir)
+        .map_err(|error| format!("更新缓存目录不可用：{error}"))?;
+    let candidate = std::fs::canonicalize(PathBuf::from(raw.trim()))
+        .map_err(|_| "安装包文件不存在，请重新下载".to_string())?;
+    if !candidate.starts_with(&cache_dir) {
+        return Err("安装包必须来自本应用的更新缓存目录".into());
+    }
+    if !candidate.is_file() {
+        return Err("安装包文件不存在，请重新下载".into());
+    }
+    Ok(candidate)
+}
+
 /// 应用内下载更新安装包，边下边发 `update-download-progress` 事件；完成后返回本地路径。
+/// 传入 `expected_digest`（发布接口给出的 sha256）时会在落盘前校验，
+/// 不一致立即删除文件，避免镜像或中间人替换安装包。
 #[tauri::command]
 pub async fn download_update_asset(
     app: AppHandle,
     state: tauri::State<'_, UpdateDownloadState>,
     url: String,
+    expected_digest: Option<String>,
 ) -> Result<DownloadedUpdateAsset, String> {
     if !is_trusted_download_url(&url) {
         return Err("更新下载地址不受信任".into());
@@ -442,6 +505,13 @@ pub async fn download_update_asset(
     file.flush()
         .map_err(|error| format!("写入更新文件失败：{error}"))?;
     drop(file);
+    if let Some(expected) = normalized_digest(expected_digest.as_deref()) {
+        let actual = file_sha256(&partial)?;
+        if actual != expected {
+            let _ = std::fs::remove_file(&partial);
+            return Err("安装包校验失败，文件已被删除，请重新下载".into());
+        }
+    }
     emit(downloaded);
     std::fs::rename(&partial, &target).map_err(|error| format!("保存更新文件失败：{error}"))?;
     Ok(DownloadedUpdateAsset {
@@ -461,10 +531,7 @@ pub fn cancel_update_download(state: tauri::State<'_, UpdateDownloadState>) {
 /// macOS：打开 dmg 镜像；Linux：打开安装包所在目录。
 #[tauri::command]
 pub async fn run_update_installer(app: AppHandle, path: String) -> Result<(), String> {
-    let path = PathBuf::from(&path);
-    if !path.is_file() {
-        return Err("安装包文件不存在，请重新下载".into());
-    }
+    let path = validated_update_asset_path(&app, &path)?;
 
     #[cfg(target_os = "windows")]
     {
@@ -482,7 +549,7 @@ pub async fn run_update_installer(app: AppHandle, path: String) -> Result<(), St
             .spawn()
             .map_err(|error| format!("启动安装程序失败：{error}"))?;
         app.exit(0);
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]
@@ -516,6 +583,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn accepts_only_well_formed_sha256_digests() {
+        let valid = "a".repeat(64);
+        assert_eq!(
+            normalized_digest(Some(&format!("sha256:{valid}"))),
+            Some(valid.clone())
+        );
+        assert_eq!(
+            normalized_digest(Some(&format!("SHA256:{}", "B".repeat(64)))),
+            Some("b".repeat(64))
+        );
+        // 算法不符、长度不符、含非 hex 字符都视为无摘要。
+        assert_eq!(normalized_digest(Some(&format!("sha512:{valid}"))), None);
+        assert_eq!(normalized_digest(Some("sha256:abc")), None);
+        assert_eq!(normalized_digest(Some(&"z".repeat(64))), None);
+        assert_eq!(normalized_digest(None), None);
+    }
+
+    #[test]
     fn compares_semantic_versions() {
         assert!(is_newer("v1.0.4", "1.0.3"));
         assert!(is_newer("1.1.0", "1.0.9"));
@@ -527,7 +612,7 @@ mod tests {
     #[test]
     fn rejects_unallowed_update_hosts() {
         assert!(validate_release_url(GITHUB_SOURCE.api).is_ok());
-        assert!(validate_release_url(GITEE_SOURCE.api).is_ok());
+        // 白名单仍接受 Gitee/GitCode，便于通过 QZONE_UPDATE_API_URL 指向镜像源。
         assert!(
             validate_release_url("https://gitee.com/api/v5/repos/example/app/releases/latest")
                 .is_ok()
@@ -560,11 +645,11 @@ mod tests {
     #[test]
     fn tries_builtin_sources_in_order() {
         let sources = effective_release_sources();
-        assert_eq!(sources.len(), 2);
+        // Gitee 仓库已 404，内置源只保留 GitHub；Gitee/GitCode 仍可通过
+        // QZONE_UPDATE_API_URL 在构建时指定为镜像。
+        assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].name, "GitHub");
-        assert_eq!(sources[1].name, "Gitee");
         assert!(sources[0].atom_fallback.is_some());
-        assert!(sources[1].atom_fallback.is_none());
         for source in &sources {
             assert!(validate_release_url(source.api).is_ok());
         }
@@ -642,18 +727,22 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_the_gitee_page_when_source_is_gitee() {
+    fn falls_back_to_the_canonical_release_page_for_alternate_source() {
         let release = serde_json::json!({
             "tag_name": "v1.2.1",
             "html_url": "https://evil.example.com/update",
             "assets": []
         });
-        let info = parse_update_info(&release, "1.2.0".into(), GITEE_SOURCE.releases_page)
-            .unwrap()
-            .unwrap();
+        let info = parse_update_info(
+            &release,
+            "1.2.0".into(),
+            "https://gitee.com/example/app/releases",
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             info.release_url,
-            "https://gitee.com/yuchen0x1/Qzone-Archive/releases/tag/v1.2.1"
+            "https://gitee.com/example/app/releases/tag/v1.2.1"
         );
     }
 }

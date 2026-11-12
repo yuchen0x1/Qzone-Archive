@@ -9,7 +9,7 @@ export default defineConfig({
   themeConfig: {
     nav: [
       { text: "文档", link: "/intro/" },
-      { text: "Gitee 仓库", link: "https://gitee.com/yuchen0x1/Qzone-Archive" },
+      { text: "GitHub 仓库", link: "https://github.com/yuchen0x1/Qzone-Archive" },
     ],
     sidebar: [
       { text: "开始使用", items: [{ text: "概览", link: "/intro/" }, { text: "安装", link: "/install/" }, { text: "首次归档", link: "/first-archive/" }, { text: "数据与安全", link: "/data-and-safety/" }] },

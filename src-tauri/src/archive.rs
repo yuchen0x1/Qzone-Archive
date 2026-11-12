@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
     sync::{
@@ -12,7 +12,7 @@ use std::{
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use serde_json::{json, Value};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use url::Url;
 
 use crate::{qlogin::QLoginState, qzone};
@@ -62,6 +62,8 @@ pub struct ArchiveState {
     batch_retrying: AtomicBool,
     batch_cancel: AtomicBool,
     image_downloads: tokio::sync::Semaphore,
+    /// 进度变化时广播事件用的句柄；None 表示尚未在 setup 中绑定。
+    app: Mutex<Option<tauri::AppHandle>>,
 }
 
 impl ArchiveState {
@@ -72,6 +74,14 @@ impl ArchiveState {
             batch_retrying: AtomicBool::new(false),
             batch_cancel: AtomicBool::new(false),
             image_downloads: tokio::sync::Semaphore::new(4),
+            app: Mutex::new(None),
+        }
+    }
+
+    /// 绑定 AppHandle，之后每次进度变化都会 emit `archive-progress`。
+    pub fn bind_app(&self, app: tauri::AppHandle) {
+        if let Ok(mut slot) = self.app.lock() {
+            *slot = Some(app);
         }
     }
 
@@ -285,11 +295,22 @@ pub(crate) fn database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 /// 数据库结构版本：仅在版本落后时执行一次建表与数据迁移；
 /// 否则归档循环里每页多次打开数据库都会重复执行 DDL 与全表扫描，库越大越慢。
-const DATABASE_SCHEMA_VERSION: i32 = 3;
+///
+/// 版本历史：
+/// - 3：分类字段、续传统计
+/// - 4：索引与迁移只在版本落后时执行（此前每次打开连接都会重跑全部 DDL）
+const DATABASE_SCHEMA_VERSION: i32 = 4;
 
 pub(crate) fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
     let mut connection = Connection::open(database_path(app)?)
         .map_err(|error| format!("无法打开归档数据库：{error}"))?;
+    configure_connection(&connection)?;
+    migrate_schema(&mut connection)?;
+    Ok(connection)
+}
+
+/// 连接级 PRAGMA：WAL、忙等、外键。每次打开都需要设置。
+fn configure_connection(connection: &Connection) -> Result<(), String> {
     connection
         .execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -297,14 +318,18 @@ pub(crate) fn open_database(app: &tauri::AppHandle) -> Result<Connection, String
              PRAGMA synchronous=NORMAL;
              PRAGMA foreign_keys=ON;",
         )
-        .map_err(|error| format!("初始化归档数据库失败：{error}"))?;
+        .map_err(|error| format!("初始化归档数据库失败：{error}"))
+}
+
+/// 结构迁移：仅在 user_version 落后时执行一次。
+/// 这是归档循环的热路径（open_database 每页被调用多次），
+/// 结构已是最新时必须完全跳过 DDL。
+fn migrate_schema(connection: &mut Connection) -> Result<(), String> {
     let schema_version: i32 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|error| format!("读取归档数据库版本失败：{error}"))?;
     if schema_version >= DATABASE_SCHEMA_VERSION {
-        init_search_index(&mut connection)?;
-        init_global_search_index(&mut connection)?;
-        return Ok(connection);
+        return Ok(());
     }
     connection
         .execute_batch(
@@ -456,14 +481,14 @@ pub(crate) fn open_database(app: &tauri::AppHandle) -> Result<Connection, String
             )
             .map_err(|error| format!("升级归档分类失败：{error}"))?;
     }
-    migrate_legacy_dynamics(&mut connection)?;
-    migrate_dynamic_categories(&mut connection)?;
-    init_search_index(&mut connection)?;
-    init_global_search_index(&mut connection)?;
+    migrate_legacy_dynamics(connection)?;
+    migrate_dynamic_categories(connection)?;
+    init_search_index(connection)?;
+    init_global_search_index(connection)?;
     connection
         .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
         .map_err(|error| format!("写入归档数据库版本失败：{error}"))?;
-    Ok(connection)
+    Ok(())
 }
 
 /// 全文搜索索引：对 archive_dynamics 的正文与作者建立 FTS5 虚拟表，
@@ -1385,11 +1410,14 @@ fn is_qq_missing_image_placeholder(bytes: &[u8]) -> bool {
     })
 }
 
+/// 归档图片可能使用的扩展名，写入与查找必须保持一致。
+pub(crate) const IMAGE_EXTENSIONS: [&str; 6] = ["jpg", "png", "gif", "webp", "avif", "bmp"];
+
 pub(crate) fn existing_archived_image(
     image_dir: &std::path::Path,
     file_stem: &str,
 ) -> Option<PathBuf> {
-    ["jpg", "png", "gif", "webp", "avif", "bmp"]
+    IMAGE_EXTENSIONS
         .into_iter()
         .map(|extension| image_dir.join(format!("{file_stem}.{extension}")))
         .find_map(|path| {
@@ -1433,6 +1461,64 @@ pub(crate) fn video_cache_path(
         .join("videos");
     fs::create_dir_all(&cache_dir).map_err(|error| format!("无法创建视频缓存目录：{error}"))?;
     Ok(cache_dir.join(format!("{uin}-{dynamic_id}.mp4")))
+}
+
+/// 视频缓存总容量上限（3 GiB）。视频文件普遍较大，超过上限后按最近最少使用淘汰。
+const VIDEO_CACHE_LIMIT_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+/// 淘汰后回落到的目标水位，留出缓冲避免每新增一个视频都要清理一次。
+const VIDEO_CACHE_TARGET_BYTES: u64 = VIDEO_CACHE_LIMIT_BYTES / 5 * 4;
+
+/// 计算需要删除的缓存文件：按修改时间从旧到新，直到总容量降到目标水位。
+/// `keep` 指向刚写入的文件，永远不会被选中。
+fn video_cache_prune_plan(
+    mut entries: Vec<(PathBuf, u64, SystemTime)>,
+    keep: Option<&std::path::Path>,
+) -> Vec<PathBuf> {
+    let mut total: u64 = entries.iter().map(|(_, size, _)| *size).sum();
+    if total <= VIDEO_CACHE_LIMIT_BYTES {
+        return Vec::new();
+    }
+    entries.sort_by_key(|(_, _, modified)| *modified);
+    let mut evicted = Vec::new();
+    for (path, size, _) in entries {
+        if total <= VIDEO_CACHE_TARGET_BYTES {
+            break;
+        }
+        if keep.is_some_and(|keep| keep == path.as_path()) {
+            continue;
+        }
+        total = total.saturating_sub(size);
+        evicted.push(path);
+    }
+    evicted
+}
+
+/// 把视频缓存目录控制在容量上限内，`keep` 为刚下载完成、需要保留的文件。
+/// 清理失败不影响播放，只记录日志，因此返回的错误由调用方决定是否忽略。
+fn prune_video_cache(
+    cache_dir: &std::path::Path,
+    keep: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let directory = match fs::read_dir(cache_dir) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("读取视频缓存目录失败：{error}")),
+    };
+    let mut entries = Vec::new();
+    for entry in directory.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        entries.push((entry.path(), metadata.len(), modified));
+    }
+    for path in video_cache_prune_plan(entries, keep) {
+        let _ = fs::remove_file(&path);
+    }
+    Ok(())
 }
 
 pub(crate) struct DownloadedImage {
@@ -1657,6 +1743,8 @@ pub async fn load_archived_video(
         .metadata()
         .is_ok_and(|metadata| metadata.len() > 1024)
     {
+        // 命中缓存时刷新 mtime，让 LRU 淘汰按真实使用顺序而非下载顺序。
+        let _ = fs::File::open(&cache_path).and_then(|file| file.set_modified(SystemTime::now()));
         return Ok(cache_path.to_string_lossy().into_owned());
     }
     let video_json = {
@@ -1737,6 +1825,13 @@ pub async fn load_archived_video(
                                 return Err("保存视频缓存失败：无法落盘临时文件".into());
                             }
                             let _ = fs::remove_file(&temporary);
+                            // 下载成功后按 LRU 控制缓存总量，失败不影响本次播放。
+                            if let Some(cache_dir) = cache_path.parent() {
+                                if let Err(error) = prune_video_cache(cache_dir, Some(&cache_path))
+                                {
+                                    eprintln!("清理视频缓存失败：{error}");
+                                }
+                            }
                             return Ok(cache_path.to_string_lossy().into_owned());
                         }
                         Ok(false) => {
@@ -1771,9 +1866,31 @@ pub async fn load_archived_video(
     }
 }
 
+/// 更新归档进度并广播 `archive-progress` 事件。
+/// 前端改用事件驱动后不必再每 600ms 轮询两个命令（其中一个还要开库查异常列表）。
 fn set_progress(state: &ArchiveState, update: impl FnOnce(&mut ArchiveProgress)) {
-    if let Ok(mut progress) = state.progress.lock() {
-        update(&mut progress);
+    let Ok(mut progress) = state.progress.lock() else {
+        return;
+    };
+    update(&mut progress);
+    let snapshot = progress.clone();
+    drop(progress);
+    push_archive_progress(state, snapshot);
+}
+
+fn push_archive_progress(state: &ArchiveState, snapshot: ArchiveProgress) {
+    let Ok(slot) = state.app.lock() else {
+        return;
+    };
+    if let Some(app) = slot.as_ref() {
+        let _ = app.emit("archive-progress", snapshot);
+    }
+}
+
+/// 主动推送当前进度（用于开始/取消等需要立即同步的时机）。
+pub(crate) fn emit_archive_progress(state: &ArchiveState) {
+    if let Ok(progress) = state.progress.lock() {
+        push_archive_progress(state, progress.clone());
     }
 }
 
@@ -2453,7 +2570,7 @@ async fn retry_single_skip(
         return Err(format!("请求频率保护中，请在 {retry_at} 后重试"));
     }
     let attempted_at = now();
-    match qzone::fetch_feeds_persistent(&login, "2", Some(&cursor)).await {
+    match qzone::fetch_feeds_persistent(login, "2", Some(&cursor)).await {
         Ok(page) => {
             let recovered_records = page.feeds.len() as u64;
             save_retried_page(app, owner_uin, &page.feeds)?;
@@ -2496,6 +2613,8 @@ async fn retry_single_skip(
 pub fn cancel_feed_archive(state: tauri::State<'_, ArchiveState>) {
     state.cancel.store(true, Ordering::Relaxed);
     state.batch_cancel.store(true, Ordering::Relaxed);
+    // 立即把“正在取消”推给前端，避免用户以为按钮没生效。
+    emit_archive_progress(&state);
 }
 
 #[tauri::command]
@@ -2505,22 +2624,43 @@ pub async fn list_archived_feeds(
     limit: u32,
     offset: u32,
     category: String,
+    order: Option<String>,
+    keyword: Option<String>,
 ) -> Result<Vec<ArchiveItem>, String> {
     validate_category(&category)?;
+    // 默认按时间倒序；概览页“最近动态”和历史阅读习惯可通过参数切换。
+    let direction = match order.as_deref().unwrap_or("desc") {
+        "asc" => "ASC",
+        "desc" => "DESC",
+        other => return Err(format!("不支持的排序方向：{other}")),
+    };
+    // 关键词在服务端过滤，分页与总数才与搜索结果一致；传 None 表示不过滤。
+    let like = keyword
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(like_pattern);
     let owner_uin = login.qzone_auth().await?.uin;
     tauri::async_runtime::spawn_blocking(move || {
     let connection = open_database(&app)?;
     let mut statement = connection
         .prepare(
-            "SELECT d.id,d.owner_uin,d.cell_id,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
-              (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type=217),
-              (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type IN (2,311))
-             FROM archive_dynamics d WHERE d.owner_uin=?1 AND d.category=?2 ORDER BY d.published_at ASC LIMIT ?3 OFFSET ?4",
+            &format!(
+                "SELECT d.id,d.owner_uin,d.cell_id,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
+                  (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type=217),
+                  (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type IN (2,311))
+                 FROM archive_dynamics d WHERE d.owner_uin=?1 AND d.category=?2
+                   AND (?5 IS NULL
+                        OR d.content LIKE ?5 ESCAPE '\\'
+                        OR d.author_name LIKE ?5 ESCAPE '\\'
+                        OR d.author_uin LIKE ?5 ESCAPE '\\')
+                 ORDER BY d.published_at {direction}, d.id {direction} LIMIT ?3 OFFSET ?4"
+            ),
         )
         .map_err(|error| format!("读取归档失败：{error}"))?;
     let rows = statement
         .query_map(
-            params![owner_uin, category, limit.clamp(1, 200), offset],
+            params![owner_uin, category, limit.clamp(1, 200), offset, like],
             |row| {
                 let video_json = row.get::<_, Option<String>>(8)?;
                 let video_urls = video_urls(video_json.clone());
@@ -2548,44 +2688,7 @@ pub async fn list_archived_feeds(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("读取归档记录失败：{error}"))?;
     drop(statement);
-    let mut comment_statement = connection
-        .prepare(
-            "SELECT comments_json,actor_uin,actor_name,event_summary,event_time FROM archive_feeds
-         WHERE owner_uin=?1 AND cell_id=?2 AND event_type IN (2,311) ORDER BY event_time ASC",
-        )
-        .map_err(|error| format!("准备评论查询失败：{error}"))?;
-    for item in &mut items {
-        let comments = comment_statement
-            .query_map(params![item.owner_uin, item.cell_id], |row| {
-                Ok(comment_from_values(
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })
-            .map_err(|error| format!("查询动态评论失败：{error}"))?;
-        item.comments = merge_comments(comments.filter_map(Result::ok));
-    }
-    drop(comment_statement);
-    let mut like_statement = connection
-        .prepare(
-            "SELECT actor_uin,actor_name FROM archive_feeds
-         WHERE owner_uin=?1 AND cell_id=?2 AND event_type=217 ORDER BY event_time ASC",
-        )
-        .map_err(|error| format!("准备点赞查询失败：{error}"))?;
-    for item in &mut items {
-        let likes = like_statement
-            .query_map(params![item.owner_uin, item.cell_id], |row| {
-                Ok(LikeUser {
-                    uin: row.get(0)?,
-                    nickname: row.get(1)?,
-                })
-            })
-            .map_err(|error| format!("查询点赞用户失败：{error}"))?;
-        item.likes = likes.filter_map(Result::ok).collect();
-    }
+    hydrate_interactions(&connection, &owner_uin, &mut items)?;
     Ok(items)
     })
     .await
@@ -2651,8 +2754,9 @@ fn search_all(
         .map(|count| count > 0)
         .unwrap_or(false);
 
-    // FTS5 前缀匹配：每个有效词转 "词"*，空格连接的词默认 AND。
-    // 纯符号关键词过滤后为空，回退 LIKE 子串匹配，避免 FTS 语法错误。
+    // FTS5 的 unicode61 分词器把连续中文当作单个词元，只能前缀命中，
+    // 搜“天气”找不到“今天天气很好”。因此只有纯 ASCII 关键词走 FTS，
+    // 含中文的关键词回退 LIKE 子串匹配以保证命中率。
     let mut matcher = String::new();
     for token in keyword
         .split_whitespace()
@@ -2665,7 +2769,7 @@ fn search_all(
         matcher.push_str(&token.replace('"', ""));
         matcher.push_str("\"*");
     }
-    let use_fts = has_fts && !matcher.is_empty();
+    let use_fts = has_fts && !matcher.is_empty() && keyword.is_ascii();
 
     let (rows_sql, params_vals, count_sql, count_params): (
         String,
@@ -2687,15 +2791,15 @@ fn search_all(
                 vec![matcher, owner_uin.to_string()],
             )
     } else {
-        let like = format!("%{keyword}%");
+        let like = like_pattern(keyword);
         (
                 "SELECT id,owner_uin,cell_id,published_at,content,author_uin,author_name,pictures_json,video_json,
                    0,0 FROM archive_dynamics
-                   WHERE owner_uin=?1 AND (content LIKE ?2 OR author_name LIKE ?2)
+                   WHERE owner_uin=?1 AND (content LIKE ?2 ESCAPE '\\' OR author_name LIKE ?2 ESCAPE '\\')
                    ORDER BY published_at DESC LIMIT ?3 OFFSET ?4"
                     .to_string(),
                 vec![owner_uin.to_string(), like.clone(), limit.to_string(), offset.to_string()],
-                "SELECT COUNT(*) FROM archive_dynamics WHERE owner_uin=?1 AND (content LIKE ?2 OR author_name LIKE ?2)".to_string(),
+                "SELECT COUNT(*) FROM archive_dynamics WHERE owner_uin=?1 AND (content LIKE ?2 ESCAPE '\\' OR author_name LIKE ?2 ESCAPE '\\')".to_string(),
                 vec![owner_uin.to_string(), like],
             )
     };
@@ -2744,45 +2848,9 @@ fn search_all(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("读取搜索结果失败：{error}"))?;
 
-        // 补充评论与点赞
-        let mut comment_statement = connection
-            .prepare(
-                "SELECT comments_json,actor_uin,actor_name,event_summary,event_time FROM archive_feeds
-             WHERE owner_uin=?1 AND cell_id=?2 AND event_type IN (2,311) ORDER BY event_time ASC",
-            )
-            .map_err(|error| format!("准备评论查询失败：{error}"))?;
-        for item in &mut items {
-            let comments = comment_statement
-                .query_map(params![item.owner_uin, item.cell_id], |row| {
-                    Ok(comment_from_values(
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                })
-                .map_err(|error| format!("查询动态评论失败：{error}"))?;
-            item.comments = merge_comments(comments.filter_map(Result::ok));
-        }
-        drop(comment_statement);
-        let mut like_statement = connection
-            .prepare(
-                "SELECT actor_uin,actor_name FROM archive_feeds
-             WHERE owner_uin=?1 AND cell_id=?2 AND event_type=217 ORDER BY event_time ASC",
-            )
-            .map_err(|error| format!("准备点赞查询失败：{error}"))?;
-        for item in &mut items {
-            let likes = like_statement
-                .query_map(params![item.owner_uin, item.cell_id], |row| {
-                    Ok(LikeUser {
-                        uin: row.get(0)?,
-                        nickname: row.get(1)?,
-                    })
-                })
-                .map_err(|error| format!("查询点赞用户失败：{error}"))?;
-            item.likes = likes.filter_map(Result::ok).collect();
-        }
+        drop(statement);
+        // 批量补充评论与点赞，避免每条结果各查两次。
+        hydrate_interactions(&connection, owner_uin, &mut items)?;
         items
     };
 
@@ -2793,6 +2861,16 @@ fn search_all(
         hits,
         total: global_total,
     })
+}
+
+/// 构造 LIKE 子串模式：转义用户输入里的 % 和 _，避免关键词被当作通配符，
+/// 与查询里的 `ESCAPE '\'` 配合使用。
+fn like_pattern(keyword: &str) -> String {
+    let escaped = keyword
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
 }
 
 fn search_global_documents(
@@ -2839,11 +2917,11 @@ fn search_global_documents(
             .map_err(|error| format!("读取全局搜索结果失败：{error}"))?;
         (total, rows)
     } else {
-        let like = format!("%{keyword}%");
+        let like = like_pattern(keyword);
         let total: u32 = connection
             .query_row(
                 "SELECT COUNT(*) FROM archive_search_documents
-                 WHERE owner_uin=?1 AND (COALESCE(title,'') LIKE ?2 OR COALESCE(body,'') LIKE ?2 OR COALESCE(author_name,'') LIKE ?2)",
+                 WHERE owner_uin=?1 AND (COALESCE(title,'') LIKE ?2 ESCAPE '\\' OR COALESCE(body,'') LIKE ?2 ESCAPE '\\' OR COALESCE(author_name,'') LIKE ?2 ESCAPE '\\')",
                 params![owner_uin, like],
                 |row| row.get(0),
             )
@@ -2852,7 +2930,7 @@ fn search_global_documents(
             .prepare(
                 "SELECT kind,ref_id,cell_id,title,body,author_name,created_at
                  FROM archive_search_documents
-                 WHERE owner_uin=?1 AND (COALESCE(title,'') LIKE ?2 OR COALESCE(body,'') LIKE ?2 OR COALESCE(author_name,'') LIKE ?2)
+                 WHERE owner_uin=?1 AND (COALESCE(title,'') LIKE ?2 ESCAPE '\\' OR COALESCE(body,'') LIKE ?2 ESCAPE '\\' OR COALESCE(author_name,'') LIKE ?2 ESCAPE '\\')
                  ORDER BY created_at DESC LIMIT ?3 OFFSET ?4",
             )
             .map_err(|error| format!("准备全局搜索失败：{error}"))?;
@@ -2963,7 +3041,7 @@ pub async fn list_archived_media(
          WHERE owner_uin=?1 AND category IN ('self','other')
            AND (pictures_json IS NOT NULL OR video_json IS NOT NULL)
            AND (?2 IS NULL OR CAST(strftime('%Y',published_at,'unixepoch','localtime') AS INTEGER)=?2)
-         ORDER BY published_at ASC,id ASC",
+         ORDER BY published_at DESC,id DESC",
     ).map_err(|error| format!("读取媒体归档失败：{error}"))?;
     let rows = statement
         .query_map(params![owner_uin, year], |row| {
@@ -3235,6 +3313,98 @@ pub(crate) fn validate_category(category: &str) -> Result<(), String> {
     }
 }
 
+/// 批量填充评论与点赞，避免每条动态各查一次数据库（N+1）。
+///
+/// 一页 20 条动态原本要发 40 次查询，改成两次 `cell_id IN (...)` 查询后
+/// 按 cell_id 分组回填。SQLite 的绑定参数上限为 999，这里分块处理。
+pub(crate) fn hydrate_interactions(
+    connection: &Connection,
+    owner_uin: &str,
+    items: &mut [ArchiveItem],
+) -> Result<(), String> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut comments_by_cell: HashMap<String, Vec<ArchiveComment>> = HashMap::new();
+    let mut likes_by_cell: HashMap<String, Vec<LikeUser>> = HashMap::new();
+
+    for chunk in items.chunks(400) {
+        let cell_ids: Vec<&str> = chunk.iter().map(|item| item.cell_id.as_str()).collect();
+        let placeholders = std::iter::repeat_n("?", cell_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let comment_sql = format!(
+            "SELECT cell_id,comments_json,actor_uin,actor_name,event_summary,event_time
+             FROM archive_feeds
+             WHERE owner_uin=? AND event_type IN (2,311) AND cell_id IN ({placeholders})
+             ORDER BY event_time ASC"
+        );
+        let mut comment_statement = connection
+            .prepare(&comment_sql)
+            .map_err(|error| format!("准备评论查询失败：{error}"))?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(cell_ids.len() + 1);
+        params.push(&owner_uin);
+        for cell_id in &cell_ids {
+            params.push(cell_id);
+        }
+        let rows = comment_statement
+            .query_map(params.as_slice(), |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    comment_from_values(
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ),
+                ))
+            })
+            .map_err(|error| format!("查询动态评论失败：{error}"))?;
+        for row in rows {
+            let (cell_id, comment) = row.map_err(|error| format!("读取动态评论失败：{error}"))?;
+            if let Some(cell_id) = cell_id {
+                comments_by_cell.entry(cell_id).or_default().push(comment);
+            }
+        }
+        drop(comment_statement);
+
+        let like_sql = format!(
+            "SELECT cell_id,actor_uin,actor_name FROM archive_feeds
+             WHERE owner_uin=? AND event_type=217 AND cell_id IN ({placeholders})
+             ORDER BY event_time ASC"
+        );
+        let mut like_statement = connection
+            .prepare(&like_sql)
+            .map_err(|error| format!("准备点赞查询失败：{error}"))?;
+        let rows = like_statement
+            .query_map(params.as_slice(), |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    LikeUser {
+                        uin: row.get(1)?,
+                        nickname: row.get(2)?,
+                    },
+                ))
+            })
+            .map_err(|error| format!("查询点赞用户失败：{error}"))?;
+        for row in rows {
+            let (cell_id, like) = row.map_err(|error| format!("读取点赞用户失败：{error}"))?;
+            if let Some(cell_id) = cell_id {
+                likes_by_cell.entry(cell_id).or_default().push(like);
+            }
+        }
+        drop(like_statement);
+    }
+
+    for item in items {
+        item.comments = merge_comments(comments_by_cell.remove(&item.cell_id).unwrap_or_default());
+        item.likes = likes_by_cell.remove(&item.cell_id).unwrap_or_default();
+    }
+    Ok(())
+}
+
 pub(crate) fn html_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -3334,44 +3504,11 @@ pub(crate) fn archive_items_for_export_since(
         items.retain(|item| ids.contains(&item.id));
     }
     drop(statement);
-    let mut comments = connection
-        .prepare(
-            "SELECT comments_json,actor_uin,actor_name,event_summary,event_time FROM archive_feeds
-         WHERE owner_uin=?1 AND cell_id=?2 AND event_type IN (2,311) ORDER BY event_time ASC",
-        )
-        .map_err(|error| format!("准备导出评论失败：{error}"))?;
-    for item in &mut items {
-        let rows = comments
-            .query_map(params![item.owner_uin, item.cell_id], |row| {
-                Ok(comment_from_values(
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })
-            .map_err(|error| format!("查询导出评论失败：{error}"))?;
-        item.comments = merge_comments(rows.filter_map(Result::ok));
-    }
-    drop(comments);
-    let mut export_likes = connection
-        .prepare(
-            "SELECT actor_uin,actor_name FROM archive_feeds
-         WHERE owner_uin=?1 AND cell_id=?2 AND event_type=217 ORDER BY event_time ASC",
-        )
-        .map_err(|error| format!("准备导出点赞查询失败：{error}"))?;
-    for item in &mut items {
-        let likes = export_likes
-            .query_map(params![item.owner_uin, item.cell_id], |row| {
-                Ok(LikeUser {
-                    uin: row.get(0)?,
-                    nickname: row.get(1)?,
-                })
-            })
-            .map_err(|error| format!("查询导出点赞用户失败：{error}"))?;
-        item.likes = likes.filter_map(Result::ok).collect();
-    }
+    let owner_uin = items
+        .first()
+        .map(|item| item.owner_uin.clone())
+        .unwrap_or_default();
+    hydrate_interactions(connection, &owner_uin, &mut items)?;
     Ok(items)
 }
 
@@ -3573,15 +3710,26 @@ pub async fn count_archived_feeds(
     app: tauri::AppHandle,
     login: tauri::State<'_, QLoginState>,
     category: String,
+    keyword: Option<String>,
 ) -> Result<u64, String> {
     validate_category(&category)?;
+    let like = keyword
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(like_pattern);
     let owner_uin = login.qzone_auth().await?.uin;
     tauri::async_runtime::spawn_blocking(move || {
         let connection = open_database(&app)?;
         connection
             .query_row(
-                "SELECT COUNT(*) FROM archive_dynamics WHERE owner_uin=?1 AND category=?2",
-                params![owner_uin, category],
+                "SELECT COUNT(*) FROM archive_dynamics
+                 WHERE owner_uin=?1 AND category=?2
+                   AND (?3 IS NULL
+                        OR content LIKE ?3 ESCAPE '\\'
+                        OR author_name LIKE ?3 ESCAPE '\\'
+                        OR author_uin LIKE ?3 ESCAPE '\\')",
+                params![owner_uin, category, like],
                 |row| row.get::<_, i64>(0),
             )
             .map(|count| count.max(0) as u64)
@@ -3777,6 +3925,7 @@ pub async fn delete_archived_feeds(
         .transaction()
         .map_err(|error| format!("开始删除事务失败：{error}"))?;
     let mut count = 0;
+    let deleted_ids = ids.clone();
     for id in ids {
         transaction.execute(
             "DELETE FROM archive_feeds WHERE owner_uin=?1 AND cell_id=(SELECT cell_id FROM archive_dynamics WHERE id=?2 AND owner_uin=?1)",
@@ -3792,7 +3941,58 @@ pub async fn delete_archived_feeds(
     transaction
         .commit()
         .map_err(|error| format!("提交删除事务失败：{error}"))?;
+    // 数据库记录删除后再清理磁盘上的图片与视频缓存，避免留下无法再被引用的孤儿文件。
+    // 清理失败不影响删除结果，只记录日志。
+    if let Err(error) = remove_archived_media_files(&app, &owner_uin, &deleted_ids) {
+        eprintln!("清理已删除归档的媒体文件失败：{error}");
+    }
     Ok(count as u64)
+}
+
+/// 删除指定动态对应的本地媒体文件：动态图片缓存在 `images/<uin>/<id>-<index>.<ext>`，
+/// 视频缓存在 `$APPCACHE/videos/<uin>-<id>.mp4`。文件缺失视为已清理。
+fn remove_archived_media_files(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+    dynamic_ids: &[i64],
+) -> Result<(), String> {
+    if dynamic_ids.is_empty() {
+        return Ok(());
+    }
+    let image_dir = archived_image_dir(app, owner_uin)?;
+    let video_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("无法获取视频缓存目录：{error}"))?
+        .join("videos");
+    remove_media_files_in(&image_dir, &video_dir, owner_uin, dynamic_ids);
+    Ok(())
+}
+
+/// `remove_archived_media_files` 的实际删除逻辑，抽成纯路径操作以便测试。
+/// 单个文件删除失败会被忽略：清理是尽力而为，失败的残留文件不影响数据正确性。
+fn remove_media_files_in(
+    image_dir: &std::path::Path,
+    video_dir: &std::path::Path,
+    owner_uin: &str,
+    dynamic_ids: &[i64],
+) {
+    for id in dynamic_ids {
+        // 动态图片：最多 16 张，覆盖常见九宫格与长图。
+        for index in 0..16 {
+            let stem = format!("{id}-{index}");
+            for extension in IMAGE_EXTENSIONS {
+                let path = image_dir.join(format!("{stem}.{extension}"));
+                if path.exists() {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+        let video = video_dir.join(format!("{owner_uin}-{id}.mp4"));
+        if video.exists() {
+            let _ = fs::remove_file(&video);
+        }
+    }
 }
 
 #[tauri::command]
@@ -3803,6 +4003,17 @@ pub async fn clear_archived_feeds(
 ) -> Result<u64, String> {
     ensure_archive_idle(&state)?;
     let owner_uin = login.qzone_auth().await?.uin;
+    // 先取出待删除的动态 ID，数据库清空后再据此清理本地媒体文件。
+    let dynamic_ids: Vec<i64> = {
+        let connection = open_database(&app)?;
+        let mut statement = connection
+            .prepare("SELECT id FROM archive_dynamics WHERE owner_uin=?1")
+            .map_err(|error| format!("读取待清空动态失败：{error}"))?;
+        let rows = statement
+            .query_map(params![owner_uin], |row| row.get::<_, i64>(0))
+            .map_err(|error| format!("读取待清空动态失败：{error}"))?;
+        rows.filter_map(Result::ok).collect()
+    };
     let connection = open_database(&app)?;
     let dynamics = connection
         .execute(
@@ -3834,6 +4045,10 @@ pub async fn clear_archived_feeds(
             params![owner_uin],
         )
         .map_err(|error| format!("清空异常待重试记录失败：{error}"))?;
+    // 数据库清空后再清理磁盘媒体，避免留下无法再被引用的孤儿文件。
+    if let Err(error) = remove_archived_media_files(&app, &owner_uin, &dynamic_ids) {
+        eprintln!("清理已清空归档的媒体文件失败：{error}");
+    }
     Ok(dynamics as u64)
 }
 
@@ -4526,15 +4741,19 @@ pub async fn export_archived_markdown(
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_feed_cursor, archive_page_delay_ms, checkpoint_is_stale, parse_feed,
-        parse_feed_cursor, serialize_query_pairs, skip_probe_offsets, ArchiveCheckpoint,
-        FeedCursorDetails,
+        advance_feed_cursor, archive_page_delay_ms, checkpoint_is_stale, hydrate_interactions,
+        like_pattern, migrate_schema, parse_feed, parse_feed_cursor, remove_media_files_in,
+        serialize_query_pairs, skip_probe_offsets, video_cache_prune_plan, ArchiveCheckpoint,
+        ArchiveItem, FeedCursorDetails, DATABASE_SCHEMA_VERSION, VIDEO_CACHE_LIMIT_BYTES,
+        VIDEO_CACHE_TARGET_BYTES,
     };
     use super::{
         comment_from_values, format_unix_time, health_message, merge_comments, parse_friend_list,
         parse_guestbook_page, reply_comments_json, GuestbookReply,
     };
     use serde_json::json;
+    use std::path::PathBuf;
+    use std::time::UNIX_EPOCH;
 
     #[test]
     fn parses_guestbook_entry_and_replies() {
@@ -4984,5 +5203,219 @@ mod tests {
             skip_probe_offsets(20),
             vec![20, 32, 64, 128, 256, 512, 1024, 2048, 4096]
         );
+    }
+
+    #[test]
+    fn escapes_wildcards_in_like_patterns() {
+        assert_eq!(like_pattern("天气"), "%天气%");
+        // 用户输入的 % 和 _ 必须被当作字面量，否则会意外匹配全部记录。
+        assert_eq!(like_pattern("100%"), "%100\\%%");
+        assert_eq!(like_pattern("a_b"), "%a\\_b%");
+        assert_eq!(like_pattern("c\\d"), "%c\\\\d%");
+    }
+
+    /// 迁移必须可重复执行：第二次调用应当直接命中快路径并保持数据不变。
+    #[test]
+    fn schema_migration_is_idempotent() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        migrate_schema(&mut connection).unwrap();
+        let version: i32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, DATABASE_SCHEMA_VERSION);
+
+        connection
+            .execute(
+                "INSERT INTO archive_dynamics(owner_uin,cell_id,published_at,content,raw_original_json,archived_at)
+                 VALUES ('10001','cell-1',1700000000,'迁移前后的内容','{}',1700000000)",
+                [],
+            )
+            .unwrap();
+
+        // 再次迁移不应重建表、不应清空数据，也不应重复占用 DDL 时间。
+        migrate_schema(&mut connection).unwrap();
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM archive_dynamics", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 1);
+        let version: i32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, DATABASE_SCHEMA_VERSION);
+    }
+
+    fn item_with_cell(cell_id: &str) -> ArchiveItem {
+        ArchiveItem {
+            id: 1,
+            owner_uin: "10001".into(),
+            cell_id: cell_id.into(),
+            published_at: 0,
+            content: None,
+            author_uin: None,
+            author_name: None,
+            picture_urls: vec![],
+            video_url: None,
+            video_urls: vec![],
+            video_cover_url: None,
+            like_count: 0,
+            comment_count: 0,
+            likes: vec![],
+            comments: vec![],
+        }
+    }
+
+    /// 批量填充必须只取当前账号、且按 cell_id 精确归属到对应动态。
+    #[test]
+    fn hydrates_comments_and_likes_per_cell_in_batches() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        migrate_schema(&mut connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO archive_feeds(owner_uin,feed_key,cell_id,event_type,event_time,content,actor_uin,actor_name,event_summary,raw_json,archived_at)
+                 VALUES ('10001','k1','cell-a',2,100,'第一条评论','20001','甲','评论','{}',0),
+                        ('10001','k2','cell-a',2,200,'第二条评论','20002','乙','评论','{}',0),
+                        ('10001','k3','cell-a',217,300,NULL,'20003','丙',NULL,'{}',0),
+                        ('10001','k4','cell-b',217,400,NULL,'20004','丁',NULL,'{}',0),
+                        ('10002','k5','cell-a',217,500,NULL,'20005','戊',NULL,'{}',0)",
+                [],
+            )
+            .unwrap();
+
+        let mut items = vec![item_with_cell("cell-a"), item_with_cell("cell-b")];
+        hydrate_interactions(&connection, "10001", &mut items).unwrap();
+
+        assert_eq!(items[0].comments.len(), 2);
+        assert_eq!(items[0].likes.len(), 1);
+        assert_eq!(items[0].likes[0].nickname.as_deref(), Some("丙"));
+        assert_eq!(items[1].comments.len(), 0);
+        assert_eq!(items[1].likes.len(), 1);
+        assert_eq!(items[1].likes[0].nickname.as_deref(), Some("丁"));
+    }
+
+    /// 空列表不应触发任何查询，也不应报错。
+    #[test]
+    fn hydrating_empty_item_list_is_noop() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        migrate_schema(&mut connection).unwrap();
+        let mut items: Vec<ArchiveItem> = Vec::new();
+        assert!(hydrate_interactions(&connection, "10001", &mut items).is_ok());
+    }
+
+    /// 删除归档时只清理命中 ID 的媒体文件，其他动态的文件必须保留。
+    #[test]
+    fn removes_only_media_files_of_deleted_dynamics() {
+        let root = std::env::temp_dir().join(format!(
+            "qzone-archive-media-cleanup-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let images = root.join("images");
+        let videos = root.join("videos");
+        std::fs::create_dir_all(&images).unwrap();
+        std::fs::create_dir_all(&videos).unwrap();
+
+        let deleted = [901i64, 902];
+        let kept = [903i64];
+        // 每个动态写入 0 号与 1 号两张图，外加扩展名不同的变体。
+        for id in deleted.iter().chain(kept.iter()) {
+            for index in 0..2 {
+                std::fs::write(images.join(format!("{id}-{index}.jpg")), b"x").unwrap();
+            }
+        }
+        std::fs::write(images.join("901-0.webp"), b"x").unwrap();
+        std::fs::write(images.join("ALBUM-1.jpg"), b"x").unwrap();
+        for id in deleted.iter().chain(kept.iter()) {
+            std::fs::write(videos.join(format!("10001-{id}.mp4")), b"x").unwrap();
+        }
+
+        remove_media_files_in(&images, &videos, "10001", &deleted);
+
+        for id in deleted {
+            for index in 0..2 {
+                assert!(
+                    !images.join(format!("{id}-{index}.jpg")).exists(),
+                    "{id}-{index}.jpg 应已删除"
+                );
+            }
+            assert!(
+                !images.join(format!("{id}-0.webp")).exists(),
+                "webp 变体应已删除"
+            );
+            assert!(
+                !videos.join(format!("10001-{id}.mp4")).exists(),
+                "视频缓存应已删除"
+            );
+        }
+        for id in kept {
+            assert!(
+                images.join(format!("{id}-0.jpg")).exists(),
+                "未删除的动态必须保留图片"
+            );
+            assert!(
+                videos.join(format!("10001-{id}.mp4")).exists(),
+                "未删除的动态必须保留视频"
+            );
+        }
+        // 文件名相似但 ID 不同的文件不能被误删。
+        assert!(images.join("ALBUM-1.jpg").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 未超限时不应淘汰任何文件。
+    #[test]
+    fn keeps_video_cache_when_under_limit() {
+        let entries = vec![
+            (
+                PathBuf::from("a.mp4"),
+                VIDEO_CACHE_LIMIT_BYTES / 4,
+                UNIX_EPOCH,
+            ),
+            (
+                PathBuf::from("b.mp4"),
+                VIDEO_CACHE_LIMIT_BYTES / 4,
+                UNIX_EPOCH,
+            ),
+        ];
+        assert!(video_cache_prune_plan(entries, None).is_empty());
+    }
+
+    /// 超限时从最旧的文件开始淘汰，直到降到目标水位，且不淘汰刚写入的文件。
+    #[test]
+    fn evicts_oldest_video_cache_files_first() {
+        let oldest = UNIX_EPOCH;
+        let newer = oldest + std::time::Duration::from_secs(60);
+        let newest = oldest + std::time::Duration::from_secs(120);
+        let chunk = VIDEO_CACHE_LIMIT_BYTES / 2;
+        // 三个半份即 1.5 倍上限：必须淘汰掉最旧的两个才能降到 4/5 上限以下。
+        let keep = PathBuf::from("c.mp4");
+        let entries = vec![
+            (PathBuf::from("b.mp4"), chunk, newer),
+            (PathBuf::from("a.mp4"), chunk, oldest),
+            (keep.clone(), chunk, newest),
+        ];
+        let evicted = video_cache_prune_plan(entries, Some(&keep));
+        assert_eq!(
+            evicted,
+            vec![PathBuf::from("a.mp4"), PathBuf::from("b.mp4")]
+        );
+        assert!(!evicted.contains(&keep), "刚下载完成的文件不能被淘汰");
+    }
+
+    /// 即使只剩刚写入的文件且仍然超限，也不能把它删掉（否则播放会立刻失败）。
+    #[test]
+    fn never_evicts_the_file_being_written() {
+        let keep = PathBuf::from("only.mp4");
+        let entries = vec![(
+            keep.clone(),
+            VIDEO_CACHE_TARGET_BYTES + VIDEO_CACHE_LIMIT_BYTES,
+            UNIX_EPOCH,
+        )];
+        assert!(video_cache_prune_plan(entries, Some(&keep)).is_empty());
     }
 }

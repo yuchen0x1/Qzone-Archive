@@ -62,6 +62,21 @@ where
         .map_err(|error| format!("无法写入备份内容：{error}"))
 }
 
+/// 图片本身已是压缩格式（JPEG/PNG/WebP/GIF/AVIF/MP4），再 deflate 只会消耗 CPU，
+/// 压缩率接近 0，因此备份媒体时使用 Stored。
+fn add_media_entry<W>(zip: &mut ZipWriter<W>, rel_path: &str, bytes: &[u8]) -> Result<(), String>
+where
+    W: std::io::Write + std::io::Seek,
+{
+    zip.start_file(
+        rel_path,
+        SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+    )
+    .map_err(|error| format!("无法写入备份文件：{error}"))?;
+    zip.write_all(bytes)
+        .map_err(|error| format!("无法写入备份内容：{error}"))
+}
+
 /// 备份全部本地归档数据：SQLite 数据库 + 归档图片目录，打包为单个 .qzbak 文件。
 #[tauri::command]
 pub async fn backup_app_data(
@@ -102,6 +117,46 @@ pub async fn backup_app_data(
     })
 }
 
+/// 递归收集图片归档目录下的全部文件，返回 (绝对路径, 相对路径) 列表。
+/// 图片按账号与相册分层存放：images/<uin>/…、images/<uin>/albums/<album_id>/…，
+/// 只扫顶层会漏掉全部媒体。符号链接一律跳过，避免把归档目录之外的文件写进备份。
+fn collect_media_files(images_dir: &Path) -> Result<Vec<(PathBuf, String)>, String> {
+    let mut files = Vec::new();
+    if !images_dir.exists() {
+        return Ok(files);
+    }
+    let mut pending = vec![images_dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries =
+            fs::read_dir(&dir).map_err(|error| format!("无法读取图片归档目录：{error}"))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("无法读取图片归档目录：{error}"))?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| format!("无法读取归档文件属性：{error}"))?;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+            let Ok(relative) = path.strip_prefix(images_dir) else {
+                continue;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            if relative.is_empty() {
+                continue;
+            }
+            files.push((path, relative));
+        }
+    }
+    Ok(files)
+}
+
 fn build_backup(
     target_path: &str,
     database: &Path,
@@ -123,24 +178,12 @@ fn build_backup(
 
         let mut image_count = 0u32;
         let mut image_bytes = 0u64;
-        if images_dir.exists() {
-            for entry in fs::read_dir(images_dir)
-                .map_err(|error| format!("无法读取图片归档目录：{error}"))?
-            {
-                let entry = entry.map_err(|error| format!("无法读取图片归档目录：{error}"))?;
-                let path = entry.path();
-                if !path.is_file() {
-                    continue;
-                }
-                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                let bytes =
-                    fs::read(&path).map_err(|error| format!("无法读取归档图片 {name}：{error}"))?;
-                image_bytes += bytes.len() as u64;
-                image_count += 1;
-                add_entry(&mut zip, &format!("images/{name}"), &bytes)?;
-            }
+        for (path, relative) in collect_media_files(images_dir)? {
+            let bytes =
+                fs::read(&path).map_err(|error| format!("无法读取归档图片 {relative}：{error}"))?;
+            image_bytes += bytes.len() as u64;
+            image_count += 1;
+            add_media_entry(&mut zip, &format!("images/{relative}"), &bytes)?;
         }
 
         zip.finish()
@@ -302,7 +345,7 @@ fn apply_restore(
             }
         }
         if images_dir.exists() {
-            fs::rename(&images_dir, &rollback_images)
+            fs::rename(images_dir, &rollback_images)
                 .map_err(|error| format!("暂存旧图片归档失败：{error}"))?;
         }
         if let Err(error) = fs::rename(staging.join("qzone-archive.sqlite3"), database) {
@@ -310,11 +353,11 @@ fn apply_restore(
             return Err(format!("恢复数据库失败：{error}"));
         }
         let restore_images = if staging_images.exists() {
-            fs::rename(&staging_images, &images_dir)
+            fs::rename(&staging_images, images_dir)
                 .map_err(|error| format!("恢复图片归档失败：{error}"))?;
             true
         } else {
-            fs::create_dir_all(&images_dir)
+            fs::create_dir_all(images_dir)
                 .map_err(|error| format!("无法重建图片归档目录：{error}"))?;
             false
         };
@@ -322,13 +365,13 @@ fn apply_restore(
             let _ = fs::remove_file(database);
             let _ = fs::rename(rollback.join("qzone-archive.sqlite3"), database);
             if restore_images {
-                let _ = fs::remove_dir_all(&images_dir);
+                let _ = fs::remove_dir_all(images_dir);
                 if rollback_images.exists() {
-                    let _ = fs::rename(&rollback_images, &images_dir);
+                    let _ = fs::rename(&rollback_images, images_dir);
                 }
             } else if rollback_images.exists() {
-                let _ = fs::remove_dir_all(&images_dir);
-                let _ = fs::rename(&rollback_images, &images_dir);
+                let _ = fs::remove_dir_all(images_dir);
+                let _ = fs::rename(&rollback_images, images_dir);
             }
             return Err(error);
         }
@@ -343,6 +386,8 @@ fn apply_restore(
 fn validate_relative_path(relative: &str) -> Result<(), String> {
     if relative.is_empty()
         || Path::new(relative).is_absolute()
+        || relative.starts_with('/')
+        || relative.starts_with('\\')
         || relative.split('\\').any(|part| part == "..")
         || relative.split('/').any(|part| part == "..")
     {
@@ -364,4 +409,73 @@ fn validate_database(database: &Path) -> Result<(), String> {
                 Err(format!("恢复数据库校验失败：{result}"))
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_media_files, validate_relative_path};
+    use std::fs;
+
+    #[test]
+    fn accepts_nested_image_paths() {
+        assert!(validate_relative_path("2026/album/photo.jpg").is_ok());
+    }
+
+    #[test]
+    fn rejects_traversal_and_absolute_image_paths() {
+        assert!(validate_relative_path("../outside.jpg").is_err());
+        assert!(validate_relative_path("nested/../../outside.jpg").is_err());
+        assert!(validate_relative_path("C:\\outside.jpg").is_err());
+        assert!(validate_relative_path("/outside.jpg").is_err());
+        assert!(validate_relative_path("\\outside.jpg").is_err());
+    }
+
+    #[test]
+    fn collects_media_files_from_nested_account_and_album_dirs() {
+        let root = std::env::temp_dir().join(format!(
+            "qzone-backup-test-{}",
+            std::process::id() as u128 * 1000 + 7
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("10001/albums/album-a")).unwrap();
+        fs::write(root.join("10001/12-0.jpg"), b"dynamic-photo").unwrap();
+        fs::write(root.join("10001/albums/album-a/pic-1.jpg"), b"album-photo").unwrap();
+
+        let mut files = collect_media_files(&root).unwrap();
+        files.sort_by(|left, right| left.1.cmp(&right.1));
+        let relatives: Vec<&str> = files.iter().map(|(_, rel)| rel.as_str()).collect();
+        assert_eq!(
+            relatives,
+            vec!["10001/12-0.jpg", "10001/albums/album-a/pic-1.jpg"]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_images_dir_collects_nothing() {
+        let root = std::env::temp_dir().join("qzone-backup-test-missing");
+        let _ = fs::remove_dir_all(&root);
+        assert!(collect_media_files(&root).unwrap().is_empty());
+    }
+
+    /// 前端用 convertFileSrc 加载本地图片/视频，CSP 必须放行 asset 协议，
+    /// 否则本地媒体会被静默拦截并回退到远程地址（断网即失效）。
+    #[test]
+    fn csp_allows_asset_protocol_for_media() {
+        let config = include_str!("../tauri.conf.json");
+        let value: serde_json::Value = serde_json::from_str(config).unwrap();
+        let csp = value["app"]["security"]["csp"].as_str().unwrap_or_default();
+        for directive in ["img-src", "media-src", "connect-src"] {
+            let start = csp
+                .split(';')
+                .map(str::trim)
+                .find(|part| part.starts_with(&format!("{directive} ")))
+                .unwrap_or_else(|| panic!("CSP 缺少 {directive} 指令"));
+            assert!(
+                start.contains("asset:"),
+                "{directive} 缺少 asset: 协议，本地媒体会被 CSP 拦截"
+            );
+        }
+    }
 }
