@@ -88,7 +88,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYyRDFBRDc2RjM5QzE2NkYKUldSdkZwenpkcTNSWWhWMFFIYU82bkJpeU5KRWIrNkl3SDFzRU1oSEpJaHVxTlZLMUdYRzRFT2IK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDgzRkJBNkZDQ0Y3QzY5QzkKUldUSmFYelAvS2I3ZzVNMlRDc0MyWGsrN0g2enJyRHB2UFdDUnhoVm1wUzdOS3p2Sy9aT29NYzMK",
       "endpoints": [
         "https://github.com/yuchen0x1/Qzone-Archive/releases/latest/download/latest.json"
       ],
