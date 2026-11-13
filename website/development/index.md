@@ -4,6 +4,8 @@ title: 开发
 
 # 开发
 
+本项目已于 2026-11-13 停止维护并转为存档。以下命令供源码研究和 Fork 维护参考，原仓库不再接受常规 PR。
+
 ## 前置条件
 
 - Node.js 20+
@@ -30,4 +32,4 @@ npm run dev
 
 ## 提交与 Pull Request
 
-遵循仓库的 [贡献指南](https://gitee.com/yuchen0x1/Qzone-Archive/blob/main/CONTRIBUTING.md)。每个 PR 聚焦一个主题，使用 Conventional Commits 标题，并说明验证方式和风险。
+历史开发约定见仓库的 [贡献指南](https://github.com/yuchen0x1/Qzone-Archive/blob/main/CONTRIBUTING.md)。继续开发请在自己的 Fork 中进行，并保留 GPLv3 许可和署名。

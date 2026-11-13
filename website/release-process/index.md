@@ -1,37 +1,22 @@
 ---
-title: 发布流程
+title: 存档与历史发布
 ---
 
-# 发布流程
+# 存档与历史发布
 
-1. 在功能分支完成一个可审查的变更。
-2. 运行应用和文档站各自的构建检查；推送至 `main` 时，Gitee 流水线（`.workflow/main-pipeline.yml`）会自动执行前端与文档站构建，Rust 侧检查（`cargo fmt --check`、`cargo test`）目前由维护者在本地执行。
-3. 提交使用 Conventional Commits，例如 `docs: add installation guide`。
-4. 合并至 `main` 后，在 Gitee Pages 中同步发布 `website/` 文档内容。
-5. 发布新版本时：将版本号统一更新（`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`nix/qzonearchive.nix` 及对应锁文件），推送 `v*` 标签，并在 Gitee Releases 中创建发布、上传 Windows、macOS、Linux 与移动端安装包。
+项目于 **2026-11-13** 停止维护并转为存档，最后发布版本为 **v1.3.5**。不再计划发布新版本、修复依赖或适配 QQ 空间接口变化。
 
-文档部署只使用 `main` 分支的 `website/` 内容。开发或预览中的文档分支不会覆盖公开站点。
+## 保留的内容
 
-Linux 发布产物包括：
+- [全部发布记录](https://github.com/yuchen0x1/Qzone-Archive/blob/main/docs/releases/release-notes.md)：当前版本线的 v1.0.0–v1.3.5。
+- [GitHub Releases](https://github.com/yuchen0x1/Qzone-Archive/releases)：7 个已有 Release 及对应安装包；v1.0.0、v1.1.0 只有源码标签。
+- v1.3.5 提供 Windows x64 NSIS 安装包、`.sig` 与 `latest.json`；v1.3.0–v1.3.3 的跨平台安装包继续保留。
+- 源码、许可证、构建配置与历史标签保留，便于按 GPLv3 研究或继续维护自己的 Fork。
 
-- `.deb`：Debian / Ubuntu
-- `.rpm`：Fedora / openSUSE / RHEL 系
-- `.AppImage`：通用 Linux 包
+## 历史发布机制
 
-本地制作 Linux 包时，需要先安装 Linux 系统依赖，再执行：
+`.github/workflows/release.yml` 原用于根据语义化版本标签构建 Windows NSIS 并上传 Tauri 更新签名；`release-assets.yml` 原用于手动修复已有 Windows Release。存档后不再执行这些流程。
 
-```bash
-sudo apt install -y \
-  libwebkit2gtk-4.1-dev \
-  build-essential \
-  curl \
-  wget \
-  file \
-  libxdo-dev \
-  libssl-dev \
-  libayatana-appindicator3-dev \
-  librsvg2-dev \
-  patchelf
-npm ci
-npx tauri build --bundles appimage,deb,rpm
-```
+旧 Gitee 流水线已经移除。原有 Windows 更新机制及验证限制见 [自动更新说明](https://github.com/yuchen0x1/Qzone-Archive/blob/main/docs/AUTO_UPDATE.md)。
+
+存档整理只修改源码和文档，不重建历史安装包，也不新增 Release。

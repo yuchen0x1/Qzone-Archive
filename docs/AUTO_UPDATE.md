@@ -1,11 +1,13 @@
 # 自动更新说明
 
-空间归档的 Windows 更新使用 Tauri 官方 `tauri-plugin-updater`。更新清单、Windows NSIS 安装包和签名文件由 GitHub Releases 提供，客户端内置公钥并在安装前验证签名。后续 Release 不再上传 macOS、Linux、Android 或 iOS 构建产物；历史 Release 可能仍保留这些资产。
+> 项目于 2026-11-13 停止维护并转为存档，最后发布版本为 v1.3.5。以下保留历史发布机制供参考，不再运行新版本发布或修复流程。历史 Release 的下载与更新文件仍保留，旧客户端可尝试检查最后版本。
+
+空间归档的 Windows 更新使用 Tauri 官方 `tauri-plugin-updater`。更新清单、Windows NSIS 安装包和签名文件由 GitHub Releases 提供，客户端内置公钥并在安装前验证签名。v1.3.4–v1.3.5 仅提供 Windows 构建产物；v1.3.0–v1.3.3 保留跨平台资产。
 
 ## 客户端流程
 
 1. Windows 启动后或用户在“关于”页手动检查时，请求配置的 `latest.json`。
-2. Tauri updater 使用 `src-tauri/tauri.conf.json` 中的 HTTPS endpoint 和公钥验证版本清单及安装包签名。
+2. Tauri updater 从 `src-tauri/tauri.conf.json` 配置的 HTTPS endpoint 读取版本清单，使用内置公钥验证安装包签名；清单本身不是独立签名文档。
 3. 用户确认后，下载回调提供真实字节进度；下载完成后才允许安装。
 4. Windows 安装器安装后自动重启。
 5. 签名、网络或安装失败时，当前版本保持可用，不执行未经验证的安装。

@@ -13,7 +13,7 @@ export default defineConfig({
     ],
     sidebar: [
       { text: "开始使用", items: [{ text: "概览", link: "/intro/" }, { text: "安装", link: "/install/" }, { text: "首次归档", link: "/first-archive/" }, { text: "数据与安全", link: "/data-and-safety/" }] },
-      { text: "参与项目", items: [{ text: "开发", link: "/development/" }, { text: "发布流程", link: "/release-process/" }] },
+      { text: "存档参考", items: [{ text: "源码开发", link: "/development/" }, { text: "存档与历史发布", link: "/release-process/" }] },
     ],
     search: { provider: "local" },
   },

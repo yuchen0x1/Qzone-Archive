@@ -2,6 +2,10 @@
 
 This document is intended for AI agents and human collaborators working in this repository. It describes the project overview and the working conventions that must be followed.
 
+## Archived Project
+
+This project stopped maintenance on 2026-11-13 (Asia/Shanghai). The final published version is v1.3.5. Keep source, licenses, version tags, release assets, and the vendored GLib security patch available for historical reference. Do not resume development, create releases, or unarchive the repository without an explicit user request. The conventions below describe the retained source and apply to any explicitly authorized follow-up work.
+
 ## Project Overview
 
 **QzoneArchive (空间归档)** is a cross-platform desktop / mobile tool that securely archives QQ Zone feeds, photos, videos, and interaction records to the local machine.
@@ -17,7 +21,7 @@ This document is intended for AI agents and human collaborators working in this 
 
 Archiving is based on QQ Zone's **mobile interaction list API** (`mobile.qzone.qq.com/get_feeds`). This endpoint returns all interaction notifications for the current account — including new feeds posted by friends, likes, comments, replies, and messages. The application extracts the original feed content from these notifications and stores it in the local database.
 
-**Feeds that have never been liked or commented on cannot be recovered**, because they never appear in the interaction list.
+**Feeds that have never been liked or commented on cannot be recovered through the interaction list.** Since v1.3.0, a separate feed-homepage sync can archive content that the homepage API still returns. Neither source can recover deleted or inaccessible content.
 
 ### Login Methods
 

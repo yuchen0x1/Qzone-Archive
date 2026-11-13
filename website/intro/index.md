@@ -5,6 +5,10 @@ description: 了解 QQ空间归档的边界、功能和适用场景。
 
 # QQ空间归档
 
+::: warning 已停止维护
+项目于 2026-11-13 停止维护并转为存档，最后发布版本为 v1.3.5。不再提供功能更新、依赖更新或安全修复，历史源码与下载保留供参考。完整版本记录见 [发布记录](https://github.com/yuchen0x1/Qzone-Archive/blob/main/docs/releases/release-notes.md)。
+:::
+
 QQ空间归档是用于**个人 QQ 空间资料备份**的本地应用。它将可访问的动态、媒体和互动记录写入设备上的 SQLite 数据库，支持按相册批量备份照片原图、同步完整留言板与好友列表，并可导出 HTML、JSON、Markdown 或包含本地媒体的 ZIP 离线包。
 
 ## 适合什么场景

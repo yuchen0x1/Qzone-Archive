@@ -1,18 +1,14 @@
 # 空间归档（Qzone Archive）
 
-> 项目状态：正常更新中。
+> **项目已停止维护，转为存档（2026-11-13）。** 最后发布版本为 **v1.3.5**。不再提供功能更新、依赖更新、安全修复或问题响应承诺；源码、历史版本和下载保留供参考。平台接口后续变化可能影响使用，请另行备份重要资料。
 
 ## 最新更新
 
 ### v1.3.5 — 2026-11-12
 
 - 修复 Windows 安装后桌面和开始菜单快捷方式显示白纸图标的问题，快捷方式现在显式使用应用图标。
-
-### v1.3.4 — 2026-11-12
-
-- Windows 更新检查在清单暂缺时安全回退到发布页。
-- 后续 Release 仅发布 Windows NSIS 安装包及签名更新清单。
-- 备份、搜索、相册进度和媒体缓存稳定性改进。
+- 修正更新签名公钥，与发布签名密钥保持一致。
+- 最后版本提供 Windows x64 安装包、签名文件与更新清单；停止维护后不再发布新版本。
 
 完整发布记录见 [`docs/releases/release-notes.md`](docs/releases/release-notes.md)。
 
@@ -69,19 +65,19 @@ QQ 空间中的历史动态与互动内容长期依赖第三方平台接口，�
 - **相册回收站恢复**：验证独立密码后浏览回收站相册与照片，可将单张照片恢复到新建或已有相册，也可整体恢复相册。
 - **数据管理**：不同 QQ 账号的归档数据隔离存储；可删除所选归档、清空归档，或在设置中一键删除全部本地数据（不可撤销）。
 - **在线更新**：Windows 桌面端使用 Tauri 官方签名更新器，启动时或在“关于”页手动检查 GitHub Releases，下载完成并通过签名校验后才安装；其他平台按源码构建。
-- **跨平台**：支持 Windows、macOS、Linux 桌面端和 Android 移动端；发布同时产出未签名的 iOS IPA（需自行签名后侧载）。
+- **跨平台源码**：保留 Windows、macOS、Linux、Android 与 iOS 构建配置；v1.3.0–v1.3.3 的历史 Release 提供过跨平台包，v1.3.4–v1.3.5 仅提供 Windows 包。
 
 ## 安装
 
 ### 下载发布包
 
-从当前维护仓库的 [Releases](https://github.com/yuchen0x1/Qzone-Archive/releases) 页面下载 Windows `.exe` 安装程序。后续 Release 只上传 Windows NSIS 安装包、Tauri 签名文件和 `latest.json`；历史 Release 可能仍保留旧平台资产，其他平台可按源码运行或构建。
+从本仓库的 [Releases](https://github.com/yuchen0x1/Qzone-Archive/releases) 页面下载最后发布的 Windows `.exe` 安装程序。v1.3.5 提供 Windows NSIS 安装包、Tauri 签名文件和 `latest.json`；旧版跨平台资产仍保留，停止维护后不再生成新包。
 
-首次启动需要阅读并同意应用内的《免责声明与使用须知》。想尝鲜最新功能，可关注 [Releases](https://github.com/yuchen0x1/Qzone-Archive/releases) 页面中的预发布版本（如有，仅建议测试使用）。
+首次启动需要阅读并同意应用内的《免责声明与使用须知》。历史安装包保留发布时的状态，下载前请核对版本和平台。
 
 ### 自动更新与发布
 
-桌面端更新清单使用 `latest.json`，由 GitHub Actions 在 `vMAJOR.MINOR.PATCH` 标签上构建并签名，并随 Windows Release 直接发布。更新签名私钥只保存在 GitHub Actions Secrets，客户端只包含公钥。完整的 Secrets 配置、发布步骤、故障恢复和 Windows-only 资产策略见 [`docs/AUTO_UPDATE.md`](docs/AUTO_UPDATE.md)。
+Windows 更新清单使用 `latest.json`，客户端只包含验证公钥。历史更新文件保留，旧客户端仍可尝试检查最后版本；存档后不再触发构建或发布。原有发布机制与限制见 [`docs/AUTO_UPDATE.md`](docs/AUTO_UPDATE.md)。
 
 ### 从源码运行
 
@@ -95,7 +91,7 @@ QQ 空间中的历史动态与互动内容长期依赖第三方平台接口，�
 - Android：Android Studio、Android SDK 和 NDK
 
 ```bash
-# 克隆当前维护仓库
+# 克隆存档源码
 git clone https://github.com/yuchen0x1/Qzone-Archive.git
 cd Qzone-Archive
 
@@ -124,7 +120,7 @@ npm run tauri dev
 │   └── src/                # lib.rs（入口与命令注册）、main.rs、qlogin.rs（登录）、qzone.rs（接口客户端）、archive.rs（归档与数据库）、updater.rs（更新检查）
 ├── website/                # 官方文档网站（VitePress）
 ├── docs/                   # 文档素材（截图等）
-└── .workflow/              # Gitee 流水线：main 分支推送时自动执行前端与文档站构建
+└── .github/workflows/      # 历史 Windows 发布流程（存档后不再运行）
 ```
 
 ## 使用方法
@@ -221,7 +217,7 @@ npm run dev
 
 因此，请注意：
 
-- 没有被点赞或评论过、未出现在互动列表中的动态无法通过本工具恢复。
+- 互动列表只能提取出现在互动记录中的动态；v1.3.0 起可另行同步说说主页仍可访问的内容，无法恢复已删除或无权访问的动态。
 - QQ 视频地址可能带有时效性签名，过期后需要重新归档以更新地址。
 - 网络中断、接口变更、限流、账号权限变化、设备故障或误操作都可能导致归档不完整。
 - 登录 Cookie 仅由 Rust 后端在内存中处理，不写入控制台或日志。
@@ -231,7 +227,7 @@ npm run dev
 ## 常见问题（FAQ）
 
 **为什么有些动态找不到？**
-程序基于互动列表归档，只有被点赞或评论过的动态才会出现在互动列表中。从未被互动的动态无法恢复。
+互动列表只包含平台返回的互动记录。v1.3.0 起可另外同步说说主页仍可访问的内容；已删除、无权访问或平台接口不再返回的动态仍无法恢复。项目停止维护后不再适配接口变化。
 
 **频繁提示频率保护怎么办？**
 每 10 分钟最多请求 300 页，触发后进度已保存，可等待倒计时结束继续。也可以换个时间段，或在“设置”中调大单页获取间隔（建议 3000–5000ms）。
@@ -256,9 +252,9 @@ QQ 视频地址带有时效签名，过期后需要重新归档以更新地址�
 
 安全策略与漏洞报告方式见 [SECURITY.md](SECURITY.md)。
 
-## 参与维护
+## 存档与源码复用
 
-欢迎提交 Issue 和 Pull Request。提交前请：
+本仓库停止接受常规 Issue 和 Pull Request，不再承诺维护或安全修复。可按 GPLv3 在自己的 Fork 中继续研究和维护；复用时请：
 
 1. 说明问题的复现步骤或功能目标。
 2. 不要提交 QQ 账号、密码、Cookie、Token、个人隐私数据、签名密钥、数据库和本地构建产物。

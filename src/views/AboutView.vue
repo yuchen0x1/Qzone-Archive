@@ -243,6 +243,15 @@ interface ChangelogEntry {
 
 const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "1.3.5",
+    date: "2026-11-12",
+    highlights: [
+      "修复 Windows 桌面和开始菜单快捷方式的白纸图标",
+      "修正更新签名公钥，与发布签名密钥保持一致",
+      "最后发布版本：Windows x64 安装包与签名更新文件",
+    ],
+  },
+  {
     version: "1.3.4",
     date: "2026-11-12",
     highlights: [
@@ -290,12 +299,12 @@ const CHANGELOG: ChangelogEntry[] = [
   },
   {
     version: "1.2.0",
-    date: "2026-11-04",
+    date: "2026-09-06",
     highlights: [
       "留言板全量同步",
       "好友列表同步与联系人页",
       "JSON / Markdown 导出（含评论、回复与点赞名单）",
-      "GitHub 首个正式 Release",
+      "源码标签发布于 9 月 6 日，GitHub 首个 Release 发布于 11 月 5 日",
     ],
   },
   {
@@ -326,7 +335,7 @@ function isCurrentVersion(version: string) {
     </header>
 
     <article class="surface-card settings-card">
-      <div class="settings-copy"><span class="settings-icon tone-blue"><i class="pi pi-book" /></span><div><h3>项目来源</h3><p>本工具源于开源的 QQ 空间归档项目（QzoneArchive），由现维护者在其基础上继续开发：新增在线更新检查、全平台自动发布与文档站点。</p></div></div>
+      <div class="settings-copy"><span class="settings-icon tone-blue"><i class="pi pi-book" /></span><div><h3>项目来源与状态</h3><p>本工具源于开源的 QQ 空间归档项目（QzoneArchive）。项目于 2026-11-13 停止维护并转为存档，最后发布版本为 v1.3.5；历史源码和下载保留，不再提供功能更新或安全修复。</p></div></div>
     </article>
 
     <article class="surface-card settings-card">

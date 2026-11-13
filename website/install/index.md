@@ -4,7 +4,7 @@ title: 安装
 
 # 安装
 
-从 [GitHub Releases](https://github.com/yuchen0x1/Qzone-Archive/releases) 下载 Windows `.exe` 安装程序。后续 Release 只上传 Windows 安装包、签名文件和 `latest.json`；其他平台请按源码构建。
+项目已于 2026-11-13 停止维护并转为存档。从 [GitHub Releases](https://github.com/yuchen0x1/Qzone-Archive/releases) 下载最后发布的 v1.3.5 Windows `.exe` 安装程序、签名文件和 `latest.json`。v1.3.0–v1.3.3 的跨平台历史安装包仍保留，不再生成新包。
 
 网站打开下载区域时会读取公开 Release API，显示当前线上版本和 Windows 安装包；网络不可达时仍可直接打开 Release 页面。桌面应用使用 Tauri 官方签名更新器，启动时或在“关于”页手动检查，只有签名校验通过后才下载并安装。
 
@@ -91,23 +91,7 @@ AppImage 是免安装的绿色软件，删除文件即可完成卸载。如果�
 
 ### NixOS
 
-每个 Release 提供 NixOS 二进制包 `qzonearchive-nixos-x86_64-linux.tar.gz`，内含预构建的完整 Nix store closure 与一键安装脚本，适用于 NixOS 及其他使用 Nix 的 x86_64 Linux 系统。**安装只需一条命令**：
-
-```bash
-tar -xzf qzonearchive-nixos-x86_64-linux.tar.gz && ./install.sh
-```
-
-安装脚本会把依赖导入 `/nix/store` 并安装到当前用户 profile。提示输入密码时输入当前用户密码即可（与 `apt`/`dpkg` 相同）。完成后在终端运行：
-
-```bash
-qzonearchive
-```
-
-> 注意：请运行包内 `./install.sh` 完成安装，不要手动对解压目录执行 `nix profile install` 或直接运行二进制——应用依赖的 store 路径必须先导入。
-
-NixOS 用户**无需 AppImage / deb / rpm**，请直接使用上方的一键安装包。
-
-项目提供源码构建用的 Nix Flake。NixOS 用户可以进入项目目录执行：
+当前 GitHub 历史 Release 没有附带 NixOS closure 安装包。仓库保留源码构建用的 Nix Flake；其版本和依赖哈希仍为旧状态，未在存档整理中验证，使用前需自行更新。下面仅保留构建命令供参考：
 
 ```bash
 nix build

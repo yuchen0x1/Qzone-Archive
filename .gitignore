@@ -42,3 +42,30 @@ sign-apk.bat
 
 # Android signing material must only exist in CI secrets or outside the repo.
 release.jks
+
+# Local credentials, signing keys, personal archives and generated reports
+.env
+.env.*
+!.env.example
+!.env.sample
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+*.db
+*.db-*
+*.qzbak
+*.bak
+*.tmp
+*.tsbuildinfo
+*.map
+.autonomous-upgrade/
+.evolution/
+PROJECT_AUDIT_REPORT.md
+website/.vitepress/dist/

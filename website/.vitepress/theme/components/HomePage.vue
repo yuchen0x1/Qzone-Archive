@@ -7,8 +7,8 @@ type ThemeMode = "system" | "light" | "dark";
 type ReleaseAsset = { name: string; size?: number; browser_download_url: string };
 type LatestRelease = { tag_name: string; html_url: string; published_at?: string; created_at?: string; assets: ReleaseAsset[] };
 
-const repoUrl = "https://gitee.com/yuchen0x1/Qzone-Archive";
-const trustedReleaseHosts = new Set(["github.com", "gitee.com", "gitcode.com"]);
+const repoUrl = "https://github.com/yuchen0x1/Qzone-Archive";
+const trustedReleaseHosts = new Set(["github.com", "api.github.com", "gitee.com", "gitcode.com"]);
 function trustedSourceUrl(raw: string | undefined): string | undefined {
   if (!raw?.trim()) return undefined;
   try {
@@ -21,7 +21,7 @@ function trustedSourceUrl(raw: string | undefined): string | undefined {
 }
 const configuredReleaseApiUrl = trustedSourceUrl(import.meta.env.VITE_UPDATE_API_URL);
 const configuredReleaseUrl = trustedSourceUrl(import.meta.env.VITE_RELEASES_URL);
-const releaseApiUrl = configuredReleaseApiUrl || "https://gitee.com/api/v5/repos/yuchen0x1/Qzone-Archive/releases/latest";
+const releaseApiUrl = configuredReleaseApiUrl || "https://api.github.com/repos/yuchen0x1/Qzone-Archive/releases/latest";
 const releaseUrl = configuredReleaseUrl
   ? configuredReleaseUrl.replace(/\/$/, "") + "/latest"
   : repoUrl + "/releases";
@@ -189,7 +189,7 @@ onBeforeUnmount(() => {
               <a class="archive-button archive-button--quiet" :href="withBase('/intro/')">先看看使用文档</a>
             </div>
             <p class="archive-boundary">本地运行 · SQLite 存储 · 不提供云端账号系统</p>
-            <p class="archive-status"><span aria-hidden="true"></span>项目状态：正常更新中</p>
+            <p class="archive-status"><span aria-hidden="true"></span>已停止维护 · 2026-11-13 存档 · 最后版本 v1.3.5</p>
           </div>
           <div class="archive-hero__preview js-reveal" style="transition-delay: 100ms">
             <div class="archive-photo-frame"><img :src="withBase('/screens/dashboard.png')" alt="QQ空间归档总览界面" /></div>
@@ -237,7 +237,7 @@ onBeforeUnmount(() => {
       </section>
 
       <section id="download" class="archive-section archive-download">
-        <div class="archive-shell"><div class="archive-section__intro js-reveal"><p class="archive-kicker">获取应用</p><h2>选择你的设备。</h2><p>从当前维护仓库的 Gitee Release 获取最新版本。</p></div>
+        <div class="archive-shell"><div class="archive-section__intro js-reveal"><p class="archive-kicker">历史下载</p><h2>选择你的设备。</h2><p>从 GitHub Releases 获取最后发布的 Windows 版本。其他平台可选择历史版本或研究源码，项目不再更新。</p></div>
           <div class="archive-release-status js-reveal" aria-live="polite"><span v-if="releaseLoading">正在检查最新版本…</span><span v-else-if="releaseError" class="archive-release-status--error">{{ releaseError }}</span><span v-else-if="release">{{ releaseIsNewer ? `发现新版本 v${releaseVersion}` : `当前已是最新版本 v${currentVersion}` }}{{ releasePublishedLabel }}</span><span v-else>尚未检查版本。</span><button type="button" @click="checkLatestRelease">{{ releaseLoading ? "检查中…" : "重新检查" }}</button></div>
           <div class="archive-downloader js-reveal"><div class="archive-platform-tabs" role="tablist" aria-label="选择平台"><button v-for="platform in platforms" :key="platform.id" type="button" role="tab" :id="`tab-${platform.id}`" :aria-selected="selectedPlatform === platform.id" :aria-controls="`panel-${platform.id}`" :class="{ active: selectedPlatform === platform.id }" @click="selectedPlatform = platform.id">{{ platform.label }}</button></div><div :id="`panel-${selectedPlatform}`" class="archive-download__body" role="tabpanel" :aria-labelledby="`tab-${selectedPlatform}`"><div><h3>{{ activePlatform.label }}</h3><p>{{ activePlatform.note }}</p><div class="archive-specs"><span><small>格式</small>{{ activePlatform.format }}</span><span><small>架构</small>{{ activePlatform.arch }}</span><span><small>系统</small>{{ activePlatform.version }}</span></div><small v-if="activeAsset" class="archive-download__asset">{{ activeAsset.name }}{{ assetSizeLabel }}</small></div><a class="archive-button" :href="downloadUrl" target="_blank" rel="noreferrer">{{ activeAsset ? "下载最新安装包" : "打开 Release 页面" }} ↗</a></div></div>
           <p class="archive-download-note">归档范围受 QQ 空间接口和账号权限限制。<a :href="withBase('/data-and-safety/')">了解使用边界</a></p>
@@ -245,6 +245,6 @@ onBeforeUnmount(() => {
       </section>
     </main>
 
-    <footer class="archive-footer"><div class="archive-shell"><div class="archive-brand"><img :src="withBase('/qzone-archive-icon.png')" alt="" /><span>QQ空间归档</span></div><p>把个人记忆，留在自己的设备上。</p><nav><a :href="withBase('/intro/')">使用文档</a><a :href="repoUrl">Gitee 仓库</a><a :href="`${repoUrl}/blob/main/LICENSE`">许可证</a></nav></div></footer>
+    <footer class="archive-footer"><div class="archive-shell"><div class="archive-brand"><img :src="withBase('/qzone-archive-icon.png')" alt="" /><span>QQ空间归档</span></div><p>把个人记忆，留在自己的设备上。</p><nav><a :href="withBase('/intro/')">使用文档</a><a :href="repoUrl">GitHub 存档仓库</a><a :href="`${repoUrl}/blob/main/LICENSE`">许可证</a></nav></div></footer>
   </div>
 </template>
